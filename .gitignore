@@ -1,0 +1,16 @@
+# Rust build output (local builds use the shared target dir; this is a fallback)
+/target/
+**/target/
+# Zig build output
+.zig-cache/
+zig-out/
+zig-pkg/
+# Benchmark raw output (commit summaries, not raw traces)
+bench/results/raw/
+*.mm_profdata
+*.profraw
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
