@@ -10,9 +10,11 @@ integration-test files, build scripts), the files the `touch-leaf` and `touch-co
 edit, and the system libraries a fresh machine needs. `[nightly]` is the pinned nightly for the
 `baseline-nightly` configuration.
 
+From the repository root:
+
 ```sh
-python3 ../scripts/check-corpus.py corpus.toml                 # shape of the file
-python3 ../scripts/check-corpus.py --verify-pins corpus.toml   # and each ref still points at its pin (CI)
+python3 scripts/check-corpus.py bench/corpus.toml                 # shape of the file
+python3 scripts/check-corpus.py --verify-pins bench/corpus.toml   # and each ref still names its pin (CI)
 ```
 
 The harness re-measures the size facts at run time and reports them beside the recorded ones;

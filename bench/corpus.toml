@@ -19,8 +19,9 @@
 #                                   from integration tests, on top of one per lib and bin
 #   build_scripts                   build.rs files
 #   touch_leaf, touch_core          the files the touch-leaf and touch-core scenarios edit (§2)
-#   system_libs                     packages a fresh Debian/Ubuntu machine needs before cargo
-#                                   can build the workspace (Linux; the harness checks for them)
+#   system_libs                     the base list of packages a fresh Debian/Ubuntu machine needs
+#                                   before cargo can build the workspace (Linux); release-specific
+#                                   additions are in `notes`
 
 schema = 1
 checked = 2026-10-22
@@ -114,4 +115,4 @@ system_libs = [
   "libxkbcommon-x11-dev", "libzstd-dev", "lld", "llvm", "make", "musl-dev", "musl-tools",
   "pipewire", "xdg-desktop-portal",
 ]
-notes = "The Debian/Ubuntu names from script/linux at the pinned commit; the same script lists the Fedora, Arch, openSUSE and Gentoo names. gpui is the UI framework every crate above it depends on; its library root is gpui.rs. Budget 40 GB of disk for a debug build."
+notes = "system_libs is the base Debian/Ubuntu list from script/linux at the pinned commit. The script adds one package by release on top of it: libstdc++-14-dev on Ubuntu 24.04/24.10 and Linux Mint 22, libstdc++-12-dev on Debian 12, Ubuntu 22.04 and Linux Mint 21, and on Debian 11 / Ubuntu 20.04 clang-18, lld-18 and libstdc++-11-dev from the ubuntu-toolchain-r PPA; Debian 13 needs nothing extra. Running script/linux on the benchmark machine is the simplest way to get them. The same script lists the Fedora, Arch, openSUSE and Gentoo names. gpui is the UI framework every crate above it depends on; its library root is gpui.rs. Budget 40 GB of disk for a debug build."

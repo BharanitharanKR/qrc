@@ -9,9 +9,9 @@ Apache-2.0 so that anything useful can go upstream to rust-lang.
 
 ## Status
 
-**Design only. Phase 0 (benchmarking) has started: the corpus is pinned in
-[`bench/corpus.toml`](bench/corpus.toml); the harness and the first runs are next.** There is no
-code, no release and no measured speedup yet. Every number in the design is either quoted from a cited source or a target
+**Design only; Phase 0 setup is under way.** The benchmark corpus is pinned in
+[`bench/corpus.toml`](bench/corpus.toml); the profiling harness and the first runs are next. There
+is no qrc implementation code, no release and no measured speedup yet. Every number in the design is either quoted from a cited source or a target
 to validate.
 
 - Design: [docs/design.md](docs/design.md) (owner draft v0.2, fact-checked)

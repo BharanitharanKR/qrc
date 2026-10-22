@@ -43,5 +43,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The pins are verified against public remotes; the token is not needed, and the
+          # next steps run code from the checked-out revision.
+          persist-credentials: false
+      - name: The ref resolver and the patterns pass their self-test
+        run: python3 scripts/check-corpus.py --self-test
       - name: bench/corpus.toml is well formed and every pin resolves at its remote
         run: python3 scripts/check-corpus.py --verify-pins bench/corpus.toml
