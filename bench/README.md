@@ -88,9 +88,12 @@ The record carries every field of the plan's example (§4) and these beside them
 
 Raw traces (the timing report, self-profile summaries, cargo's log) go to `results/raw/`, which is
 git-ignored; the binary self-profile traces are deleted once summarized unless `--keep-traces` is
-given, since they run to gigabytes over a full set; only the JSONL files under `results/` and the §5 report are committed.
+given, since they run to gigabytes over a full set; only the JSONL files under `results/` and the §5 report (with its charts) are committed.
 [`analyze.py`](analyze.py) reports medians and the run-to-run spread, flags scenarios whose
 spread is above 5 percent (the plan then asks for 5 runs), and writes the time-share table,
-a bar and the top three hypotheses per workspace. `python3 bench/analyze.py --self-test`
+a stacked bar and the top three hypotheses per workspace. The bar is text by default;
+`--svg-dir DIR` also draws each cold scenario's bar as an SVG file in `DIR`, and with `--out`
+the report embeds those charts by links relative to the report file (for instance
+`--out docs/benchmarks/phase-0.md --svg-dir docs/benchmarks/phase-0`). `python3 bench/analyze.py --self-test`
 checks it against [`tests/fixture.jsonl`](tests/fixture.jsonl), and `python3 bench/run.py --self-test` runs
 the measurement path on real subprocesses and checks the size facts and share arithmetic; CI runs both.

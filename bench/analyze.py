@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Summarize Phase 0 results (docs/phase-0.md §5): medians and spread per scenario, the
-time-share breakdown per workspace as a table and a bar, and the top hypotheses.
+time-share breakdown per workspace as a table and a stacked bar (text, or SVG files with
+--svg-dir), and the top hypotheses.
 
     python3 bench/analyze.py bench/results/*.jsonl            # markdown on stdout
     python3 bench/analyze.py --out docs/benchmarks/phase-0.md bench/results/*.jsonl
+    python3 bench/analyze.py --out docs/benchmarks/phase-0.md --svg-dir docs/benchmarks/phase-0 bench/results/*.jsonl
     python3 bench/analyze.py --self-test                       # the fixture under bench/tests
 
 Standard library only. Reads the JSON objects bench/run.py writes, one per line.
@@ -13,10 +15,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
+import re
 import statistics
 import sys
+import tempfile
+import urllib.parse
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 HERE = Path(__file__).resolve().parent
 SHARE_KEYS = ("deps", "proc_macro_build_rs", "front_end", "codegen", "debuginfo", "link", "idle")
@@ -31,6 +40,18 @@ HYPOTHESIS = {
 }
 SCENARIO_ORDER = ("cold-build", "cold-test", "check", "noop", "touch-leaf", "touch-core", "deps-only")
 BAR = "█"
+COLD = ("cold-build", "cold-test")  # the scenarios whose time share the report breaks down
+
+# Chart colours: one fixed hue per hypothesis, in SHARE_KEYS order, so a hue names the same
+# hypothesis in every chart whichever segments it skips. Blue #2a78d6, orange #eb6834,
+# aqua #1baf7a, yellow #eda100, magenta #e87ba4, green #008300, violet #6250d6. In this order,
+# neighbouring segments stay apart under simulated protanopia and deuteranopia (OKLab distance
+# of 0.09 or more on white), both with all seven shares (nightly) and without debuginfo and
+# link (stable). Colour is never the only cue: wide segments carry their share as text, the
+# legend names every segment, and the table sits next to the chart.
+PALETTE = dict(zip(SHARE_KEYS, ("#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6")))
+INK, INK_MUTED, SURFACE, TRACK = "#1a1a19", "#52514e", "#ffffff", "#e3e3e0"
+FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
 
 
 def load(paths: list[Path]) -> list[dict]:
@@ -127,6 +148,11 @@ def share_rows(runs: list[dict]) -> dict[str, float | None]:
     return out
 
 
+def share_runs(by_scenario: dict, scenario: str) -> list[dict]:
+    """The successful runs of a scenario that carry a time-share breakdown."""
+    return [r for r in by_scenario.get(scenario, []) if "error" not in r and r.get("share")]
+
+
 def bar(shares: dict[str, float | None], width: int = 60) -> str:
     parts, legend = [], []
     for k in SHARE_KEYS:
@@ -138,7 +164,142 @@ def bar(shares: dict[str, float | None], width: int = 60) -> str:
     return "".join(parts) + "\n" + "  " + " · ".join(legend)
 
 
-def report(rows: list[dict], preamble: str = "") -> str:
+def slug(*parts: str) -> str:
+    """A file-name stem of [a-z0-9-]: ('example/ws', 'baseline-stable on fixture (-j 8)',
+    'cold-build') gives 'example-ws-baseline-stable-on-fixture-j-8-cold-build'."""
+    return re.sub(r"[^a-z0-9]+", "-", "-".join(parts).lower()).strip("-") or "chart"
+
+
+def luminance(colour: str) -> float:
+    """WCAG relative luminance of a #rrggbb colour."""
+    def linear(c: int) -> float:
+        s = c / 255
+        return s / 12.92 if s <= 0.04045 else ((s + 0.055) / 1.055) ** 2.4
+    r, g, b = (linear(int(colour[i:i + 2], 16)) for i in (1, 3, 5))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a: str, b: str) -> float:
+    hi, lo = sorted((luminance(a), luminance(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def label_colour(fill: str) -> str:
+    """White or ink for text on a fill, whichever has the higher contrast ratio."""
+    return "#ffffff" if contrast("#ffffff", fill) >= contrast(INK, fill) else INK
+
+
+def text_width(text: str, size: float) -> float:
+    """A generous estimate of the rendered width of sans-serif text: a hand-written SVG has no
+    layout engine to ask."""
+    return 0.62 * size * len(text)
+
+
+def bar_svg(workspace: str, setting_name: str, scenario: str, shares: dict[str, float | None], runs: int) -> str:
+    """One horizontal stacked bar of the shares, as a standalone SVG document.
+
+    The bar is the build's whole slot capacity. Null and zero shares are skipped. When the
+    shares sum to less than 1.0 the rest is drawn as an empty track, "not attributed"; when
+    they sum to more (the sources overlap) the bar is scaled to fit. Every text value is
+    XML-escaped."""
+    pad, font, bar_y, bar_h, gap = 16, 12, 64, 28, 2
+    uid = "chart-" + slug(workspace, setting_name, scenario)
+    drawn = [(k, shares[k]) for k in SHARE_KEYS if shares.get(k) is not None and shares[k] > 0]
+    total = sum(v for _, v in drawn)
+    rest = 1 - total if total < 0.995 else 0.0  # slot capacity neither source attributes
+    scale = 1 / (total + rest)
+    parts = [(HYPOTHESIS[k], v, PALETTE[k]) for k, v in drawn]
+    if rest:
+        parts.append(("not attributed", rest, TRACK))
+
+    of_runs = f"median of {runs} run{'' if runs == 1 else 's'}"
+    title = f"{workspace}, {setting_name}, {scenario}: time share per hypothesis, {of_runs}"
+    heading = f"Time share: {workspace}, {scenario}"
+    sub = f"{setting_name}, {of_runs}"
+    if total > 1.005:
+        sub += f"; the shares sum to {total:.2f} and are drawn scaled to fit"
+    listing = [f"{HYPOTHESIS[k]}: {pct(shares.get(k))}" for k in SHARE_KEYS]
+    if rest:
+        listing.append(f"not attributed: {pct(rest)}")
+    desc = (f"Stacked bar of the share of the build's slot capacity (wall time x jobs) per hypothesis, {of_runs}. "
+            + "; ".join(listing) + f". The shares shown sum to {total:.2f}.")
+
+    legend = [(colour, name, pct(v)) for name, v, colour in parts]
+    item_w = max(text_width(f"{name} {value}", font) for _, name, value in legend) + 16 + 24
+    width = math.ceil(max(720, text_width(heading, 15) + 2 * pad, text_width(sub, font) + 2 * pad, item_w + 2 * pad))
+    inner = width - 2 * pad
+    cols = 2 if 2 * item_w <= inner else 1
+    legend_y = bar_y + bar_h + 20
+    height = legend_y + (math.ceil(len(legend) / cols) - 1) * 20 + 10 + pad
+
+    out = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" '
+        f'role="img" aria-labelledby="{uid}-title {uid}-desc" font-family="{FONT}">',
+        f'<title id="{uid}-title">{escape(title)}</title>',
+        f'<desc id="{uid}-desc">{escape(desc)}</desc>',
+        f'<defs><clipPath id="{uid}-clip"><rect x="{pad}" y="{bar_y}" width="{inner}" height="{bar_h}" rx="4"/></clipPath></defs>',
+        f'<rect width="{width}" height="{height}" fill="{SURFACE}"/>',
+        f'<text x="{pad}" y="30" font-size="15" font-weight="600" fill="{INK}">{escape(heading)}</text>',
+        f'<text x="{pad}" y="50" font-size="{font}" fill="{INK_MUTED}">{escape(sub)}</text>',
+        f'<g clip-path="url(#{uid}-clip)">',
+    ]
+    labels = []
+    x = float(pad)
+    for i, (name, v, colour) in enumerate(parts):
+        w = v * scale * inner
+        seg_w = w if i == len(parts) - 1 else max(w - gap, 0.5)  # a 2 px surface gap between segments
+        value = pct(v)
+        out.append(f'<rect x="{x:.2f}" y="{bar_y}" width="{seg_w:.2f}" height="{bar_h}" fill="{colour}">'
+                   f'<title>{escape(f"{name}: {value}")}</title></rect>')
+        if seg_w >= text_width(value, font) + 12:
+            labels.append(f'<text x="{x + seg_w / 2:.2f}" y="{bar_y + bar_h / 2 + font * 0.35:.2f}" font-size="{font}" '
+                          f'font-weight="600" text-anchor="middle" fill="{label_colour(colour)}">{escape(value)}</text>')
+        x += w
+    out.append("</g>")
+    out += labels
+    for i, (colour, name, value) in enumerate(legend):
+        lx = pad + (i % cols) * inner / cols
+        ly = legend_y + (i // cols) * 20
+        out.append(f'<rect x="{lx:.2f}" y="{ly}" width="10" height="10" rx="2" fill="{colour}"/>')
+        out.append(f'<text x="{lx + 16:.2f}" y="{ly + 10}" font-size="{font}" fill="{INK}">{escape(name)} '
+                   f'<tspan fill="{INK_MUTED}">{escape(value)}</tspan></text>')
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def write_charts(rows: list[dict], svg_dir: Path) -> dict[tuple[str, str, str], Path]:
+    """One stacked-bar SVG per workspace, setting and cold scenario that has shares, written to
+    svg_dir; returns {(workspace, setting, scenario): path}."""
+    svg_dir.mkdir(parents=True, exist_ok=True)
+    g = group(rows)
+    written: dict[tuple[str, str, str], Path] = {}
+    used: set[str] = set()
+    for ws in sorted(g):
+        for config in sorted(g[ws]):
+            for scenario in COLD:
+                runs = share_runs(g[ws][config], scenario)
+                if not runs:
+                    continue
+                stem = base = slug(ws, config, scenario)
+                n = 1
+                while stem in used:  # two settings that differ only in punctuation
+                    n += 1
+                    stem = f"{base}-{n}"
+                used.add(stem)
+                path = svg_dir / f"{stem}.svg"
+                path.write_text(bar_svg(ws, config, scenario, share_rows(runs), len(runs)) + "\n", encoding="utf-8")
+                written[(ws, config, scenario)] = path
+    return written
+
+
+def chart_link(svg: Path, out: Path) -> str:
+    """The SVG's path relative to the report's directory, as the URL of a markdown image."""
+    return urllib.parse.quote(Path(os.path.relpath(svg.resolve(), out.resolve().parent)).as_posix())
+
+
+def report(rows: list[dict], preamble: str = "", charts: dict[tuple[str, str, str], str] | None = None) -> str:
+    """The §5 report as markdown. `charts` maps (workspace, setting, scenario) to an image link
+    that takes the place of that scenario's text bar."""
     g = group(rows)
     out = ["# Phase 0 baseline: where debug-build time goes", ""]
     if preamble.strip():
@@ -164,8 +325,8 @@ def report(rows: list[dict], preamble: str = "") -> str:
             out.append("")
             out.extend(scenario_table(by_scenario))
             out.append("")
-            for scenario in ("cold-build", "cold-test"):
-                runs = [r for r in by_scenario.get(scenario, []) if "error" not in r and r.get("share")]
+            for scenario in COLD:
+                runs = share_runs(by_scenario, scenario)
                 if not runs:
                     continue
                 shares = share_rows(runs)
@@ -177,9 +338,12 @@ def report(rows: list[dict], preamble: str = "") -> str:
                 for k in SHARE_KEYS:
                     out.append(f"| {HYPOTHESIS[k]} | {pct(shares[k])} |")
                 out.append("")
-                out.append("```")
-                out.append(bar(shares))
-                out.append("```")
+                link = (charts or {}).get((ws, config, scenario))
+                if link:
+                    alt = f"Stacked bar of the time share, {ws}, {config}, {scenario}".replace("[", "(").replace("]", ")")
+                    out += [f"![{alt}]({link})", ""]
+                else:
+                    out += ["```", bar(shares), "```"]
                 top = sorted(((v, k) for k, v in shares.items() if v is not None), reverse=True)[:3]
                 out.append("Top hypotheses: " + ", ".join(f"{HYPOTHESIS[k]} ({pct(v)})" for v, k in top) + ".")
                 all_crates = [r.get("sections_all_crates") for r in runs if r.get("sections_all_crates")]
@@ -236,6 +400,38 @@ def self_test() -> int:
     assert median([r["wall_s"] for r in g["example/ws"]["baseline-stable on fixture-2 (-j 8)"]["cold-build"]]) == 30.0
     # Idle is hypothesis 7 and can rank: on the second machine it is the largest share.
     assert "Top hypotheses: 7. scheduling gaps (idle slots) (70%)" in text, text
+    # Without --svg-dir the report keeps its text bar, so the default output does not change.
+    assert BAR in text and "![" not in text, text
+    # One SVG per workspace, setting and cold scenario with shares; noop has shares but no chart.
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        written = write_charts(rows, root / "charts")
+        first = ("example/ws", "baseline-stable on fixture (-j 8)", "cold-build")
+        second = ("example/ws", "baseline-stable on fixture-2 (-j 8)", "cold-build")
+        assert sorted(written) == [first, second], written
+        assert written[first] == root / "charts" / "example-ws-baseline-stable-on-fixture-j-8-cold-build.svg", written
+        assert all(p.is_file() for p in written.values()), written
+        svg = written[first].read_text(encoding="utf-8")
+        ET.fromstring(svg)  # well-formed XML
+        assert "<title" in svg and "<desc" in svg and "median of 3 runs" in svg, svg
+        # The <desc> lists every share, the unmeasured ones too.
+        for share in ("1. cold dependency compilation: 50%", "2. proc macros and build.rs: 5%", "3. front end: 20%",
+                      "4. monomorphization and codegen: 15%", "5. debug info: n/a", "6. linking: n/a",
+                      "7. scheduling gaps (idle slots): 10%"):
+            assert share in svg, (share, svg)
+        assert svg.count(">50%<") == 2, svg  # the deps segment's label and its legend entry
+        assert "not attributed" not in svg, svg  # the fixture's shares sum to 1.0
+        svg2 = written[second].read_text(encoding="utf-8")
+        ET.fromstring(svg2)
+        assert "7. scheduling gaps (idle slots): 70%" in svg2 and ">70%<" in svg2, svg2
+        # Text is escaped: a hostile name still parses, and reads back as written.
+        odd = bar_svg('a<b>&"c"', "x & y", "cold-build", shares, len(runs))
+        assert ET.fromstring(odd).findtext("{http://www.w3.org/2000/svg}title").startswith('a<b>&"c", x & y'), odd
+        # With --out, the report links each chart relative to the report file, in place of the text bar.
+        out = root / "report" / "phase-0.md"
+        linked = report(rows, "", {key: chart_link(p, out) for key, p in written.items()})
+        assert "](../charts/example-ws-baseline-stable-on-fixture-j-8-cold-build.svg)" in linked, linked
+        assert BAR not in linked, linked
     print("analyze.py self-test: ok")
     return 0
 
@@ -245,6 +441,8 @@ def main() -> int:
     ap.add_argument("results", nargs="*", type=Path)
     ap.add_argument("--out", type=Path, help="write the markdown here instead of stdout")
     ap.add_argument("--preamble", type=Path, help="markdown placed under the title (status, caveats), kept across regenerations")
+    ap.add_argument("--svg-dir", type=Path, metavar="DIR",
+                    help="write each cold scenario's time-share bar here as an SVG; with --out, the report embeds them")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -252,7 +450,14 @@ def main() -> int:
     paths = args.results or sorted((HERE / "results").glob("*.jsonl"))
     if not paths:
         sys.exit("no results files")
-    text = report(load(paths), args.preamble.read_text() if args.preamble else "")
+    rows = load(paths)
+    charts = None
+    if args.svg_dir:
+        written = write_charts(rows, args.svg_dir)
+        print(f"wrote {len(written)} charts to {args.svg_dir}", file=sys.stdout if args.out else sys.stderr)
+        if args.out:
+            charts = {key: chart_link(svg, args.out) for key, svg in written.items()}
+    text = report(rows, args.preamble.read_text() if args.preamble else "", charts)
     if args.out:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(text + "\n")
