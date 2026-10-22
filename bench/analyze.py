@@ -69,11 +69,18 @@ def pct(v: float | None) -> str:
     return "n/a" if v is None else f"{100 * v:.0f}%"
 
 
+def setting(r: dict) -> str:
+    """The configuration a run belongs to, including the machine and -j: runs from different
+    computers or job counts are separate baselines, never one median."""
+    m = r.get("machine") or {}
+    return f"{r['config']} on {m.get('label', 'unknown machine')} (-j {m.get('jobs', '?')})"
+
+
 def group(rows: list[dict]) -> dict:
-    """{workspace: {config: {scenario: [runs]}}}, errors kept aside."""
+    """{workspace: {setting: {scenario: [runs]}}}; failed runs stay in their scenario."""
     g: dict = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
     for r in rows:
-        g[r["workspace"]][r["config"]][r["scenario"]].append(r)
+        g[r["workspace"]][setting(r)][r["scenario"]].append(r)
     return g
 
 
@@ -162,7 +169,7 @@ def report(rows: list[dict], preamble: str = "") -> str:
                 out.append("```")
                 out.append(bar(shares))
                 out.append("```")
-                top = sorted(((v, k) for k, v in shares.items() if v is not None and k != "idle"), reverse=True)[:3]
+                top = sorted(((v, k) for k, v in shares.items() if v is not None), reverse=True)[:3]
                 out.append("Top hypotheses: " + ", ".join(f"{HYPOTHESIS[k]} ({pct(v)})" for v, k in top) + ".")
                 all_crates = [r.get("sections_all_crates") for r in runs if r.get("sections_all_crates")]
                 if all_crates:
@@ -184,7 +191,7 @@ def self_test() -> int:
     fixture = HERE / "tests" / "fixture.jsonl"
     rows = load([fixture])
     g = group(rows)
-    runs = g["example/ws"]["baseline-stable"]["cold-build"]
+    runs = g["example/ws"]["baseline-stable on fixture (-j 8)"]["cold-build"]
     walls = [r["wall_s"] for r in runs]
     assert median(walls) == 10.0, median(walls)
     assert abs(spread(walls) - 0.2) < 1e-9, spread(walls)
@@ -196,6 +203,13 @@ def self_test() -> int:
     assert "| cold-build | 3 | 10.00 s | 20% (above 5%: run 5) |" in text, text
     assert "1. cold dependency compilation | 50%" in text
     assert "Failed runs" in text and "run 1: cargo exited 101" in text
+    # A failed run is counted in its own scenario row, under the same workspace and setting.
+    assert "| check | 0 (1 failed) |" in text, text
+    # A second machine is a second baseline: its 30 s run does not move the first one's median.
+    assert "baseline-stable on fixture-2 (-j 8)" in g["example/ws"], list(g["example/ws"])
+    assert median([r["wall_s"] for r in g["example/ws"]["baseline-stable on fixture-2 (-j 8)"]["cold-build"]]) == 30.0
+    # Idle is hypothesis 7 and can rank: on the second machine it is the largest share.
+    assert "Top hypotheses: 7. scheduling gaps (idle slots) (70%)" in text, text
     print("analyze.py self-test: ok")
     return 0
 

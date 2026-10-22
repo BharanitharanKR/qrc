@@ -17,8 +17,9 @@ python3 scripts/check-corpus.py bench/corpus.toml                 # shape of the
 python3 scripts/check-corpus.py --verify-pins bench/corpus.toml   # and each ref still names its pin (CI)
 ```
 
-The harness re-measures the size facts at run time and reports them beside the recorded ones;
-the recorded ones are there so results can be read without fetching anything.
+The harness measures the same facts from the checkout, with the definitions in the file's header,
+records them in every result as `size_facts`, and warns when they differ from `corpus.toml`. The
+checkout is always at the pinned commit, so a difference means the recorded value is wrong.
 
 ## Harness
 
@@ -80,6 +81,7 @@ The record carries every field of the plan's example (§4) and these beside them
 | `sections_all_crates` | front end and codegen as fractions of compile time over every crate, dependencies included |
 | `phase_all_crates`, `self_profile` | nightly only: the self-profile split over every crate, and the profiled build's crate count and wall time |
 | `timings_summary` | cargo's own summary rows (total, fresh and dirty units, max concurrency, total time) |
+| `size_facts` | the corpus's size facts measured from the checkout (see [Corpus](#corpus)) |
 | `test_run` | `cold-test` only: the test run itself, timed after the build (`cargo nextest run` when installed, else `cargo test`) |
 | `derived_from`, `dep_slot_seconds` | `deps-only` only: the cold build it was read from, and the dependency units' slot-seconds |
 | `error`, `log` | a failed run: what failed and where cargo's log is |
@@ -90,4 +92,5 @@ given, since they run to gigabytes over a full set; only the JSONL files under `
 [`analyze.py`](analyze.py) reports medians and the run-to-run spread, flags scenarios whose
 spread is above 5 percent (the plan then asks for 5 runs), and writes the time-share table,
 a bar and the top three hypotheses per workspace. `python3 bench/analyze.py --self-test`
-checks it against [`tests/fixture.jsonl`](tests/fixture.jsonl); CI runs that.
+checks it against [`tests/fixture.jsonl`](tests/fixture.jsonl), and `python3 bench/run.py --self-test` runs
+the measurement path on real subprocesses and checks the size facts and share arithmetic; CI runs both.

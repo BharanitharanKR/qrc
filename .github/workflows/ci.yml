@@ -64,4 +64,5 @@ jobs:
         run: |
           python3 -m py_compile bench/run.py bench/analyze.py scripts/check-corpus.py
           python3 bench/run.py --list
+          python3 bench/run.py --self-test
           python3 bench/analyze.py --self-test

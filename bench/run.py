@@ -28,7 +28,6 @@ import json
 import os
 import platform
 import re
-import resource
 import shutil
 import subprocess
 import sys
@@ -110,6 +109,47 @@ def fetch(ws: dict, work: Path) -> Path:
     if dirty:
         sys.exit(f"{d} has local modifications; `git checkout -- .` there first:\n{dirty}")
     return d
+
+
+SIZE_FACTS = ("manifests", "lock_packages", "rs_files", "rs_lines", "integration_tests", "build_scripts")
+
+
+def size_facts(wsdir: Path) -> dict[str, int]:
+    """The corpus's size facts (bench/corpus.toml), measured from the checkout.
+
+    One definition for every workspace: `target/` and `.git/` are skipped; `rs_lines` counts
+    newlines, as `wc -l` does; `integration_tests` counts `.rs` files directly in a crate's
+    `tests/` directory (the one beside a Cargo.toml), cargo's default integration-test targets.
+    """
+    facts = dict.fromkeys(SIZE_FACTS, 0)
+    manifest_dirs: set[Path] = set()
+    tests_files: list[Path] = []
+    for d, dirs, files in os.walk(wsdir):
+        dirs[:] = [x for x in dirs if x not in ("target", ".git")]
+        here = Path(d)
+        for name in files:
+            if name == "Cargo.toml":
+                facts["manifests"] += 1
+                manifest_dirs.add(here)
+            elif name == "build.rs":
+                facts["build_scripts"] += 1
+            if name.endswith(".rs"):
+                facts["rs_files"] += 1
+                with open(here / name, "rb") as f:
+                    facts["rs_lines"] += f.read().count(b"\n")
+                if here.name == "tests":
+                    tests_files.append(here)
+    facts["integration_tests"] = sum(1 for t in tests_files if t.parent in manifest_dirs)
+    lock = wsdir / "Cargo.lock"
+    if lock.exists():
+        facts["lock_packages"] = lock.read_text().count("\n[[package]]") + lock.read_text().startswith("[[package]]")
+    return facts
+
+
+def check_size_facts(ws: dict, measured: dict[str, int]) -> list[str]:
+    """Fields where the checkout disagrees with the corpus. The checkout is at the pinned
+    commit, so a difference means the recorded value is wrong, not the build."""
+    return [f"{k}: corpus {ws[k]}, checkout {measured[k]}" for k in SIZE_FACTS if ws.get(k) != measured[k]]
 
 
 # --- toolchain and machine -----------------------------------------------------------------
@@ -208,12 +248,13 @@ class RssSampler(threading.Thread):
         self.peak_kib = 0
         self.samples = 0
         self.failures = 0
-        self._stop = threading.Event()
+        # Not `_stop`: threading.Thread has a `_stop()` method that join() calls on 3.11 and 3.12.
+        self._stop_event = threading.Event()
 
     def run(self) -> None:
-        while not self._stop.is_set() and self.failures < 3:
+        while not self._stop_event.is_set() and self.failures < 3:
             self.sample()
-            self._stop.wait(self.interval)
+            self._stop_event.wait(self.interval)
 
     def descendants(self) -> list[int]:
         pids, frontier = [self.root], [self.root]
@@ -254,32 +295,37 @@ class RssSampler(threading.Thread):
         self.peak_kib = max(self.peak_kib, total)
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.join(timeout=5)
 
 
 def measure(cmd: list[str], cwd: Path, env: dict[str, str], logfile: Path) -> dict:
-    """Run one command: wall time, the children's CPU time (rusage) and the tree's peak RSS."""
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    """Run one command: its wall time, its CPU time and its memory.
+
+    CPU time and the largest single process come from wait4() on this command alone (cargo
+    and every descendant it waited for), not from RUSAGE_CHILDREN, which is cumulative over
+    the harness's life and would hand an earlier warm-up build's peak to a no-op build. The
+    wall clock stops when the command exits, before the memory sampler is joined.
+    """
     t0 = time.monotonic()
     with open(logfile, "w") as out:
         proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT, text=True)
         sampler = RssSampler(proc.pid)
         sampler.start()
-        code = proc.wait()
+        _, status, usage = os.wait4(proc.pid, 0)
+        wall = time.monotonic() - t0
+        code = os.waitstatus_to_exitcode(status)
+        proc.returncode = code  # reaped here; Popen must not wait for it again
         sampler.stop()
-    wall = time.monotonic() - t0
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    maxrss = after.ru_maxrss
     # ru_maxrss is bytes on macOS and KiB on Linux.
-    max_process_mib = maxrss / 2**20 if platform.system() == "Darwin" else maxrss / 1024
+    max_process_mib = usage.ru_maxrss / 2**20 if platform.system() == "Darwin" else usage.ru_maxrss / 1024
     if sampler.samples == 0:
         log("  no memory sample succeeded; peak_rss_mib is the largest single process (rusage)")
     return {
         "exit": code,
         "wall_s": round(wall, 3),
-        "user_s": round(after.ru_utime - before.ru_utime, 3),
-        "sys_s": round(after.ru_stime - before.ru_stime, 3),
+        "user_s": round(usage.ru_utime, 3),
+        "sys_s": round(usage.ru_stime, 3),
         "peak_rss_mib": round(max(sampler.peak_kib / 1024, max_process_mib), 1),
         "max_process_rss_mib": round(max_process_mib, 1),
         "rss_samples": sampler.samples,
@@ -413,13 +459,13 @@ def summarize_profiles(prof_dir: Path) -> dict | None:
         log("summarize (cargo install --git https://github.com/rust-lang/measureme summarize) is not on PATH; no phase split")
         return {"error": "summarize not installed", "profiles": len(files)}
     per_crate: dict[str, dict[str, float]] = {}
+    failed: list[str] = []
     for f in files:
         prefix = str(f)[: -len(".mm_profdata")]
         r = run([summarize, "summarize", "--json", prefix])
-        if r.returncode:
-            continue
         js = Path(prefix + ".json")
-        if not js.exists():
+        if r.returncode or not js.exists():
+            failed.append(f.name)
             continue
         data = json.loads(js.read_text())
         crate = f.name.rsplit("-", 1)[0]
@@ -434,6 +480,11 @@ def summarize_profiles(prof_dir: Path) -> dict | None:
             else:
                 phases["front_end"] += st
             phases["total"] += st
+    if failed:
+        # One unreadable trace and the sums are short by an unknown amount: the shares that
+        # depend on them stay unknown rather than reading as a measured zero.
+        log(f"  summarize failed on {len(failed)} of {len(files)} traces; link and debuginfo stay unknown")
+        return {"error": f"summarize failed on {len(failed)} of {len(files)} traces", "profiles": len(files), "failed": failed[:10]}
     return {"profiles": len(files), "crates": per_crate}
 
 
@@ -526,8 +577,9 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
         restore(wsdir, touched)
     if m["exit"] != 0:
         log(f"  cargo exited {m['exit']}; see {raw / 'cargo.log'}")
-        return [{"schema": SCHEMA, "workspace": ws["name"], "scenario": scenario, "config": config, "run": index,
-                 "error": f"cargo exited {m['exit']}", "log": str(raw / "cargo.log")}]
+        failed = base_record(ctx, scenario, index, m)
+        failed.update({"error": f"cargo exited {m['exit']}", "log": str(raw / "cargo.log")})
+        return [failed]
 
     report = newest_timing_report(target, started)
     timing = parse_timing_report(report) if report else None
@@ -665,6 +717,7 @@ def base_record(ctx: dict, scenario: str, index: int, m: dict) -> dict:
         "run": index,
         "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
         "toolchain": {**ctx["toolchain"], "linker": ctx["linker"]},
+        "size_facts": ctx["size_facts"],
         "machine": ctx["machine"],
         "wall_s": m["wall_s"],
         "user_s": m["user_s"],
@@ -677,6 +730,54 @@ def base_record(ctx: dict, scenario: str, index: int, m: dict) -> dict:
         "target_dir_mib": 0,
         "share": None,
     }
+
+
+def self_test() -> int:
+    """What CI can check without building a workspace: the measurement path, the size facts,
+    and the share arithmetic. The measurement path runs real subprocesses, so a regression in
+    the sampler or in wait4 handling fails here rather than on the first benchmark."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        m = measure(["sleep", "0.2"], root, dict(os.environ), root / "sleep.log")
+        assert m["exit"] == 0 and m["wall_s"] >= 0.2 and m["peak_rss_mib"] >= 0, m
+        m = measure(["sh", "-c", "exit 3"], root, dict(os.environ), root / "exit.log")
+        assert m["exit"] == 3, m
+
+        ws = root / "ws"
+        files = {
+            "Cargo.toml": "[workspace]\n",
+            "Cargo.lock": "version = 4\n\n[[package]]\nname = \"a\"\n\n[[package]]\nname = \"b\"\n",
+            "src/main.rs": "fn main() {\n}\n// end\n",
+            "tests/cli.rs": "#[test]\nfn t() {}\n",
+            "crates/x/Cargo.toml": "[package]\n",
+            "crates/x/build.rs": "fn main() {}\n",
+            "crates/x/src/tests/unit.rs": "// a unit-test module, not an integration test\n",
+            "crates/x/src/prebuild.rs": "// not a build script\n",
+            "target/debug/build/gen.rs": "// skipped: target/\n",
+        }
+        for rel, text in files.items():
+            (ws / rel).parent.mkdir(parents=True, exist_ok=True)
+            (ws / rel).write_text(text)
+        got = size_facts(ws)
+        want = {"manifests": 2, "lock_packages": 2, "rs_files": 5, "rs_lines": 8, "integration_tests": 1, "build_scripts": 1}
+        assert got == want, (got, want)
+
+    units = [
+        {"name": "dep", "target": "", "mode": "todo", "duration": 2.0, "sections": [["frontend", {"start": 0, "end": 1.5}], ["codegen", {"start": 1.5, "end": 2.0}]]},
+        {"name": "dep", "target": " build-script (run)", "mode": "run-custom-build", "duration": 1.0},
+        {"name": "app", "target": " app \"bin\"", "mode": "todo", "duration": 3.0, "sections": [["frontend", {"start": 0, "end": 1.0}], ["codegen", {"start": 1.0, "end": 3.0}]]},
+        {"name": "app", "target": " it \"test\" (test)", "mode": "todo", "duration": 1.0},
+    ]
+    c = classify_units(units, {"app"})
+    assert (c["deps"], c["proc_macro_build_rs"], c["workspace"], c["test_binaries"]) == (2.0, 1.0, 4.0, 1), c
+    assert (c["ws_front_end"], c["ws_codegen"]) == (2.0, 2.0), c
+    assert deps_finished_at([{"name": "dep", "start": 1.0, "duration": 2.0}, {"name": "app", "start": 3.0, "duration": 1.0}], {"app"}) == 3.0
+    # 4 slots, 2 busy for the first 5 s, 4 busy for the last 5: 10 idle slot-seconds.
+    assert idle_slot_seconds([{"t": 0.0, "active": 2}, {"t": 5.0, "active": 4}], 4, 10.0) == 10.0
+    print("run.py self-test: ok")
+    return 0
 
 
 # --- main ----------------------------------------------------------------------------------
@@ -698,7 +799,10 @@ def main() -> int:
     ap.add_argument("--online", action="store_true", help="let the timed cargo runs reach the network (default: --offline after one untimed `cargo fetch`)")
     ap.add_argument("--keep-traces", action="store_true", help="keep the binary self-profile traces (default: delete them once summarized)")
     ap.add_argument("--list", action="store_true", help="list workspaces, scenarios and configurations")
+    ap.add_argument("--self-test", action="store_true", help="check the measurement path, size facts and share arithmetic, then exit")
     args = ap.parse_args()
+    if args.self_test:
+        return self_test()
 
     corpus = load_corpus(args.corpus)
     if args.list or not args.workspace:
@@ -715,7 +819,13 @@ def main() -> int:
     if "deps-only" in scenarios and "cold-build" in scenarios:
         scenarios.remove("cold-build")  # deps-only is derived from the same cold build
     jobs = args.jobs or os.cpu_count() or 1
-    if str(args.work).startswith("/tmp"):
+    # Absolute paths: CARGO_TARGET_DIR is resolved by cargo from the workspace directory, so a
+    # relative --work would point cargo and the harness at different target directories.
+    args.work = args.work.expanduser().resolve()
+    args.raw = args.raw.expanduser().resolve()
+    if args.results:
+        args.results = args.results.expanduser().resolve()
+    if any(str(args.work).startswith(t) for t in ("/tmp", "/private/tmp")):
         sys.exit("--work must not be under /tmp (plan §6)")
     args.work.mkdir(parents=True, exist_ok=True)
 
@@ -727,6 +837,9 @@ def main() -> int:
     members = workspace_member_names(cargo, wsdir, env)
     if not members:
         sys.exit("cargo metadata gave no workspace members")
+    facts = size_facts(wsdir)
+    for mismatch in check_size_facts(ws, facts):
+        log(f"warning: bench/corpus.toml is wrong for {ws['name']}: {mismatch}")
     # The registry index and every crate the lockfile names, fetched once and untimed, so that
     # no timed run contains a download; the timed runs then pass --offline unless --online.
     log("cargo fetch (untimed)")
@@ -741,6 +854,7 @@ def main() -> int:
         "ws": ws, "wsdir": wsdir, "cargo": cargo, "config": args.config, "jobs": jobs, "env": env,
         "members": members, "toolchain": toolchain, "linker": linker_info(CONFIGS[args.config][1]),
         "machine": machine, "raw": raw, "offline": not args.online, "keep_traces": args.keep_traces,
+        "size_facts": facts,
     }
     log(f"{ws['name']} @ {ws['commit'][:8]} | {args.config} | {toolchain['rustc']} | -j {jobs} | {machine['cpu']}, {machine['cores']} cores, {machine['ram_gib']} GiB")
     log(f"results -> {results}; raw -> {raw}")
