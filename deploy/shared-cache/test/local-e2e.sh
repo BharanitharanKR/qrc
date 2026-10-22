@@ -211,7 +211,9 @@ STORE_URL="$endpoint" RUSTFS_ENV="$tmp/rustfs.env" KEYS_DIR="$tmp/keys" "$setup"
 sed 's/^/   /' "$tmp/logs/setup.log"
 maintainer_key="$tmp/keys/maintainer-e2e.env"
 ci_ro_key="$tmp/keys/ci-ro.env"
-[ -s "$maintainer_key" ] && [ -s "$ci_ro_key" ] || die "setup.sh did not write both key files"
+if [ ! -s "$maintainer_key" ] || [ ! -s "$ci_ro_key" ]; then
+  die "setup.sh did not write both key files"
+fi
 
 rc --quiet alias set e2eadmin "$endpoint" "$(cat "$tmp/root-access-key")" "$(cat "$tmp/root-secret-key")" > /dev/null
 
