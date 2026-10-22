@@ -111,3 +111,6 @@ python3 bench/simulate.py bench/results/<date>-<label>.jsonl --scenario cold-bui
 python3 bench/simulate.py <report> --hit-fraction 0.8 --cache-aware
 python3 bench/simulate.py --self-test
 ```
+
+Reports passed directly are separate groups, so their medians are never pooled; pass
+`--group <name>` when several reports really are runs of the same build.

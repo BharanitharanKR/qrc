@@ -348,11 +348,8 @@ def simulate(build: Build, policy: Policy, jobs: int, hits: CacheHits | None = N
                 if waiting[c] == 0:
                     become_ready(c, t)
 
-    for i in build.order:
-        if waiting[i] == 0:
-            become_ready(i, now)
-
-    while True:
+    def apply_due() -> None:
+        nonlocal free
         while events and events[0][0] <= now + EPS:
             t, kind, _, i = heapq.heappop(events)
             if kind == META:
@@ -362,13 +359,22 @@ def simulate(build: Build, policy: Policy, jobs: int, hits: CacheHits | None = N
                 if i not in slotless:
                     free += 1
                 release(i, ("full",) if pipelining else ("full", "rmeta"), t)
+
+    for i in build.order:
+        if waiting[i] == 0:
+            become_ready(i, now)
+
+    while True:
+        apply_due()
         while free > 0 and ready:
             _, i = heapq.heappop(ready)
             free -= 1
             busy += dur[i]
             begin(i, now)
-        if events and events[0][0] <= now + EPS:
-            continue  # a zero-length unit finished at once
+            # A start can release a dependent at this same instant (a zero-length front end,
+            # or a zero-length unit). Apply those releases before choosing the next unit, so a
+            # newly ready, higher-priority dependent takes the slot rather than unrelated work.
+            apply_due()
         if not events:
             break
         now = events[0][0]
@@ -827,6 +833,12 @@ def self_test() -> int:
     check(close(simulate(pair, POLICIES["pipelined"], 2)["critical_path_s"], 6.0)
           and close(simulate(pair, POLICIES["fifo"], 2)["critical_path_s"], 9.0), "pair critical paths")
 
+    # A zero-length front end: a (10 s, metadata at 0) releases d (100 s) at once, beside an
+    # independent b (2 s). Pipelined on two slots, d takes the second slot at t=0 and the build
+    # ends at 100, not 102 after b; a release must be applied before filling another slot.
+    instant = _graph([_u(0, 10.0, rmeta=[1], frontend=0.0), _u(1, 100.0), _u(2, 2.0)], jobs=2)
+    check(close(wall(instant, "pipelined", 2), 100.0), f"instant metadata pipelined -j 2: {wall(instant, 'pipelined', 2)}")
+
     # A releaser with no frontend section: its metadata time comes from the recording.
     nosec = _graph([_u(0, 4.0, rmeta=[1]), _u(1, 1.0, start=1.5)])
     check(nosec.meta_from_recording == 1 and close(nosec.units[0].meta, 1.5), f"metadata from recording: {nosec.units[0].meta}")
@@ -936,6 +948,8 @@ def main() -> int:
     ap.add_argument("--run", help="JSONL input: only these run indexes (comma-separated)")
     ap.add_argument("--workspace", help="JSONL input: only workspaces whose name contains this")
     ap.add_argument("--raw", type=Path, help="JSONL input: where run.py left the raw traces (default: <JSONL dir>/raw)")
+    ap.add_argument("--group", help="reports given directly: a shared group for their combined median "
+                                    "(default: each report is its own group, so unrelated builds are not pooled)")
     ap.add_argument("--corpus", type=Path, default=HERE / "corpus.toml", help="maps a result's workspace to its raw directory name")
     ap.add_argument("--json", action="store_true", help="print JSON instead of tables")
     ap.add_argument("--self-test", action="store_true", help="check the simulator on synthetic DAGs with known answers, then exit")
@@ -985,7 +999,9 @@ def main() -> int:
             sources.extend(found)
             notes.extend(warnings)
         else:
-            sources.append(Source(report=path, title=str(path), group="reports given on the command line"))
+            # Each report given directly is a separate build, so it gets its own group unless the
+            # user says these reports belong together; summarize() then skips a group of one.
+            sources.append(Source(report=path, title=str(path), group=args.group or str(path)))
     for n in notes:
         print(f"simulate.py: {n}", file=sys.stderr)
     if not sources:
