@@ -30,3 +30,18 @@ time (21.9 s and 22.0 s user). Read the stable-to-nightly difference on this mac
 ripgrep is the corpus's floor (§1): 59 packages in `Cargo.lock`, a cold build of 7 to 9 seconds here. What
 it shows is how much of even a small build is spent outside the workspace's own code; it says
 little about where a large workspace's time goes, which is what the other three are for.
+
+**The nightly test runs failed; the builds did not.** All five nightly `cold-test` runs built the
+test binaries and then exited 101 from the test run itself (stable's five exited 0). 313 of
+ripgrep's 323 integration tests panicked in `tests/tests.rs`, and the cause is the test binary's
+location, not the build: the tests run `rg` from `<test executable dir>/../rg`, and
+nightly-2026-10-15's cargo 1.101 writes test executables to
+`target/debug/build/<crate>/<hash>/out/` instead of `target/debug/deps/`, so that path is a build
+directory with no `rg` in it while the binary itself is at `target/debug/rg`. The layout change is
+cargo's rather than the harness's: a two-file probe crate shows the same move, and the harness sets
+nothing but `CARGO_TARGET_DIR`. Reproduced on 2026-10-22 on the pinned checkout: after
+`cargo +nightly-2026-10-15 test --workspace --no-run`, `cargo +nightly-2026-10-15 test --workspace`
+gives 10 passed and 313 failed. So the cold-test build timings stand, but nothing here says
+ripgrep's suite passes on nightly; a cold-test result is only citable once a toolchain whose layout
+matches 1.99.1's, or a workspace whose tests do not locate their binary relative to the test
+executable, has run green.
