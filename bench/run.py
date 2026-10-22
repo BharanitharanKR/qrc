@@ -513,6 +513,10 @@ KACHE_SUMMARY = ("local_hits", "prefetch_hits", "remote_hits", "misses", "dups",
 KACHE_TIMING = ("total_restore_ms", "total_store_ms")
 
 
+class CacheStillRunning(RuntimeError):
+    """The kache daemon did not exit, so its store must not be wiped underneath it."""
+
+
 def read_toml(path: Path) -> dict:
     try:
         with open(path, "rb") as f:
@@ -644,7 +648,9 @@ def wait_unlocked(lock: Path, timeout: float) -> bool:
 def cache_stop(cache: dict, env: dict[str, str]) -> float:
     """Stop this invocation's sccache server or kache daemon; the seconds that took. kache's
     daemon first finishes work a build queued (uploads to a remote, for one); sccache has written
-    each entry before the compile returns. A no-op when none is running."""
+    each entry before the compile returns. A no-op when none is running. Raises CacheStillRunning
+    when kache's daemon is still alive: its store must not be wiped or reused while it could be
+    writing into it."""
     t0 = time.monotonic()
     if cache["tool"] == "sccache":
         cache_tool(cache, env, ["--stop-server"])
@@ -652,7 +658,10 @@ def cache_stop(cache: dict, env: dict[str, str]) -> float:
     else:
         cache_tool(cache, env, ["daemon", "stop"])
         if not wait_unlocked(cache["store"] / "daemon.run.lock", 900):
-            log("  warning: the kache daemon was still running 15 minutes after `kache daemon stop`")
+            cache["still_running"] = True
+            raise CacheStillRunning(
+                f"the kache daemon was still running 15 minutes after `kache daemon stop`; "
+                f"leaving {cache['store']} in place")
     return round(time.monotonic() - t0, 3)
 
 
@@ -769,13 +778,15 @@ def cache_after(cache: dict, env: dict[str, str], before: dict[str, int] | None)
                 log(f"  sccache stored entries in {location!r}, not this invocation's {cache['backend']} cache")
                 invalid = f"sccache did not use this invocation's {cache['backend']} cache (see the log)"
         stats["stop_s"] = cache_stop(cache, env)
-        return stats, invalid
+        # A failed counter read is a rejected run: analyze.py only sees the row's `error`, and a
+        # hit rate of n/a with no reason reads as a successful run that had nothing to count.
+        return stats, invalid or stats.get("error")
     # kache: stopped first, so whatever its daemon finishes after the build is in the report.
     stop_s = cache_stop(cache, env)
     after = kache_report(cache, env)
     stats = kache_stats(before, after) if before is not None and after is not None else {"error": "kache report gave no JSON before or after the build"}
     stats["stop_s"] = stop_s
-    return stats, None
+    return stats, stats.get("error")
 
 
 # --- one run -------------------------------------------------------------------------------
@@ -1271,12 +1282,23 @@ def main() -> int:
                                 f"peak {rec.get('peak_rss_mib')} MiB units {rec.get('units')} "
                                 f"deps {sh.get('deps')} pm {sh.get('proc_macro_build_rs')} idle {sh.get('idle')}"
                                 + (f" hit rate {cs.get('hit_rate')}" if cs else ""))
+    except CacheStillRunning as e:
+        log(f"error: {e}")
+        return 1
     finally:
         if cache is not None and "root" in cache:
             # The cache is this invocation's alone; nothing reuses it, and it runs to gigabytes.
-            cache_stop(cache, cargo_env(env, args.config, wsdir / "target", None, cache))
-            shutil.rmtree(cache["root"], ignore_errors=True)
-            log(f"removed the {cache['tool']} cache directory {cache['root']}")
+            # Keep it when its daemon may still be writing to it (CacheStillRunning).
+            if cache.get("still_running"):
+                log(f"  keeping the {cache['tool']} cache directory {cache['root']}: its daemon may still be running")
+            else:
+                try:
+                    cache_stop(cache, cargo_env(env, args.config, wsdir / "target", None, cache))
+                except CacheStillRunning as e:
+                    log(f"  {e}")
+                else:
+                    shutil.rmtree(cache["root"], ignore_errors=True)
+                    log(f"removed the {cache['tool']} cache directory {cache['root']}")
     return 0
 
 
