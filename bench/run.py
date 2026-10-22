@@ -1,0 +1,764 @@
+#!/usr/bin/env python3
+"""The Phase 0 harness driver (docs/phase-0.md §2 to §4).
+
+Fetches a corpus workspace at its pin, runs the scenarios under one named
+configuration, and appends one JSON object per run to a results file in the
+schema the plan gives. Standard library only; cargo, rustup and (for the
+nightly configuration) measureme's `summarize` do the work.
+
+    python3 bench/run.py --list
+    python3 bench/run.py ripgrep                       # every scenario, baseline-stable, 3 runs
+    python3 bench/run.py ripgrep --config baseline-nightly --scenarios cold-build,noop --runs 1
+
+Scenarios (plan §2): cold-build, cold-test, check, noop, touch-leaf, touch-core, deps-only.
+`deps-only` is derived from a cold build's timings (the moment the last dependency unit
+finished) rather than run as its own build; see the bench README.
+
+Configurations (plan §3): `baseline-stable` and `baseline-nightly` are Phase 0's. The Phase 1
+names are defined here already so Phase 1 is a flag away, but they are not measured in Phase 0.
+
+Nothing here reads or writes outside the work directory, the results file and the raw directory.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import re
+import resource
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import tomllib
+from pathlib import Path
+
+SCHEMA = 1
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+
+SCENARIOS = ("cold-build", "cold-test", "check", "noop", "touch-leaf", "touch-core", "deps-only")
+
+# name -> (needs nightly, extra RUSTFLAGS, extra env, note)
+CONFIGS: dict[str, tuple[bool, list[str], dict[str, str], str]] = {
+    "baseline-stable": (False, [], {}, "the workspace's own toolchain and profile, unchanged"),
+    "baseline-nightly": (True, [], {}, "the same on the pinned nightly: -Zself-profile and the unit graph"),
+    # Phase 1 (plan §3), named now, not run in Phase 0.
+    "cranelift": (True, ["-Zcodegen-backend=cranelift"], {}, "rustc_codegen_cranelift for the dev profile"),
+    "line-tables-only": (False, [], {"CARGO_PROFILE_DEV_DEBUG": "line-tables-only"}, "debug = line-tables-only"),
+    "debug-0": (False, [], {"CARGO_PROFILE_DEV_DEBUG": "0"}, "debug = 0"),
+    "mold": (False, ["-Clink-arg=-fuse-ld=mold"], {}, "the mold linker (Linux)"),
+    "wild": (False, ["-Clink-arg=-fuse-ld=wild"], {}, "the wild linker (Linux)"),
+    "lld": (False, ["-Clink-arg=-fuse-ld=lld"], {}, "the lld linker"),
+    "threads-4": (True, ["-Zthreads=4"], {}, "the parallel front end, 4 threads"),
+    "share-generics": (True, ["-Zshare-generics=y"], {}, "-Zshare-generics"),
+}
+
+# Self-profile query labels -> the plan's hypotheses (design §2). Everything a rustc process
+# does that is not codegen, linking or debug info is the front end (parse, expand, resolve,
+# typeck, borrowck, MIR, metadata, incremental bookkeeping).
+PHASE_PATTERNS = (
+    ("link", re.compile(r"^(link|run_linker|linker)")),
+    ("debuginfo", re.compile(r"debuginfo|dwarf", re.I)),
+    ("codegen", re.compile(r"^(codegen|LLVM_|monomorph|target_machine|assemble|finish_ongoing_codegen|copy_all_cgu|write_|serialize_work_products)")),
+)
+
+
+def log(msg: str) -> None:
+    print(f"[bench] {msg}", file=sys.stderr, flush=True)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, text=True, capture_output=True, check=False, **kw)
+
+
+def first_line(s: str) -> str:
+    return s.strip().splitlines()[0] if s.strip() else ""
+
+
+# --- corpus and workspace ------------------------------------------------------------------
+
+
+def load_corpus(path: Path) -> dict:
+    with open(path, "rb") as f:
+        return tomllib.load(f)
+
+
+def workspace(corpus: dict, name: str) -> dict:
+    for ws in corpus["workspace"]:
+        if ws["name"] == name:
+            return ws
+    sys.exit(f"no workspace `{name}` in the corpus; --list shows them")
+
+
+def fetch(ws: dict, work: Path) -> Path:
+    """The workspace at its pinned commit, cloned on first use and verified on every use."""
+    d = work / ws["name"]
+    if not d.exists():
+        log(f"cloning {ws['repo']} at {ws['ref']} into {d}")
+        r = run(["git", "clone", "--quiet", "--depth", "1", "--branch", ws["ref"], ws["repo"], str(d)])
+        if r.returncode:
+            sys.exit(f"clone failed: {r.stderr.strip()}")
+    head = run(["git", "rev-parse", "HEAD"], cwd=d).stdout.strip()
+    if head != ws["commit"]:
+        sys.exit(f"{d} is at {head}, not the pinned {ws['commit']}; move it aside")
+    dirty = run(["git", "status", "--porcelain", "--untracked-files=no"], cwd=d).stdout.strip()
+    if dirty:
+        sys.exit(f"{d} has local modifications; `git checkout -- .` there first:\n{dirty}")
+    return d
+
+
+# --- toolchain and machine -----------------------------------------------------------------
+
+
+def toolchain_for(ws: dict, corpus: dict, config: str) -> str:
+    needs_nightly = CONFIGS[config][0]
+    return corpus["nightly"]["channel"] if needs_nightly else ws["toolchain"]
+
+
+def ensure_toolchain(tc: str, config: str) -> dict:
+    r = run(["rustup", "toolchain", "install", tc, "--profile", "minimal", "--no-self-update"])
+    if r.returncode:
+        sys.exit(f"rustup toolchain install {tc} failed: {first_line(r.stderr)}")
+    if config == "cranelift":
+        run(["rustup", "component", "add", "rustc-codegen-cranelift-preview", "--toolchain", tc])
+    rustc = first_line(run(["rustc", f"+{tc}", "-vV"]).stdout)
+    cargo = first_line(run(["cargo", f"+{tc}", "-V"]).stdout)
+    host = ""
+    for line in run(["rustc", f"+{tc}", "-vV"]).stdout.splitlines():
+        if line.startswith("host:"):
+            host = line.split(":", 1)[1].strip()
+    return {"name": tc, "rustc": rustc, "cargo": cargo, "host": host}
+
+
+def linker_info(extra_rustflags: list[str]) -> str:
+    for f in extra_rustflags:
+        if "-fuse-ld=" in f:
+            name = f.split("-fuse-ld=")[1]
+            v = run([name, "--version"])
+            return first_line(v.stdout or v.stderr) or name
+    cc = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc") or "cc"
+    v = run([cc, "--version"])
+    return f"system default via {first_line(v.stdout) or cc}"
+
+
+def machine_info(jobs: int, label: str | None) -> dict:
+    sysname = platform.system()
+    cpu, ram_gib, disk = "", 0.0, "unknown"
+    if sysname == "Darwin":
+        cpu = run(["sysctl", "-n", "machdep.cpu.brand_string"]).stdout.strip()
+        mem = run(["sysctl", "-n", "hw.memsize"]).stdout.strip()
+        ram_gib = round(int(mem) / 2**30, 1) if mem.isdigit() else 0.0
+        info = run(["diskutil", "info", "/"]).stdout
+        m = re.search(r"Solid State:\s*(\w+)", info)
+        disk = {"Yes": "ssd", "No": "hdd"}.get(m.group(1), "unknown") if m else "unknown"
+    elif sysname == "Linux":
+        try:
+            for line in open("/proc/cpuinfo"):
+                if line.lower().startswith("model name"):
+                    cpu = line.split(":", 1)[1].strip()
+                    break
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemTotal:"):
+                    ram_gib = round(int(line.split()[1]) / 2**20, 1)
+                    break
+        except OSError:
+            pass
+        rot = sorted(Path("/sys/block").glob("*/queue/rotational"))
+        if rot:
+            disk = "hdd" if any(p.read_text().strip() == "1" for p in rot) else "ssd"
+    cpu = cpu or platform.processor() or platform.machine()
+    # A label for the results file name and the report, not the hostname: results are
+    # committed, and a hostname is a personal detail that says nothing about the hardware.
+    slug = re.sub(r"[^a-z0-9]+", "-", cpu.lower()).strip("-")[:40] or "machine"
+    return {
+        "label": label or slug,
+        "cpu": cpu,
+        "arch": platform.machine(),
+        "cores": os.cpu_count() or 0,
+        "jobs": jobs,
+        "ram_gib": ram_gib,
+        "disk": disk,
+        "os": platform.platform(),
+    }
+
+
+# --- measurement ---------------------------------------------------------------------------
+
+
+class RssSampler(threading.Thread):
+    """Peak resident memory of a process tree, sampled twice a second.
+
+    rusage only reports the largest single child, and a build is many rustc processes at once;
+    the plan asks for the peak of the whole build. The tree is walked with `pgrep -P` and only
+    those pids are asked for their RSS (`/proc` on Linux, `ps -o rss= -p` elsewhere): listing
+    every process on the machine can block on an unrelated wedged process, and a sample must
+    never stall the build. A sample that takes longer than two seconds is dropped, and after
+    three such drops the sampler gives up and the record says so (`rss_samples` = 0).
+    """
+
+    def __init__(self, root_pid: int, interval: float = 0.5) -> None:
+        super().__init__(daemon=True)
+        self.root = root_pid
+        self.interval = interval
+        self.peak_kib = 0
+        self.samples = 0
+        self.failures = 0
+        self._stop = threading.Event()
+
+    def run(self) -> None:
+        while not self._stop.is_set() and self.failures < 3:
+            self.sample()
+            self._stop.wait(self.interval)
+
+    def descendants(self) -> list[int]:
+        pids, frontier = [self.root], [self.root]
+        while frontier:
+            try:
+                r = subprocess.run(["pgrep", "-P", ",".join(map(str, frontier))], capture_output=True, text=True, timeout=2)
+            except subprocess.TimeoutExpired:
+                return pids
+            frontier = [int(x) for x in r.stdout.split() if x.isdigit()]
+            pids.extend(frontier)
+        return pids
+
+    def rss_kib(self, pids: list[int]) -> int | None:
+        if platform.system() == "Linux":
+            total = 0
+            for pid in pids:
+                try:
+                    for line in open(f"/proc/{pid}/status"):
+                        if line.startswith("VmRSS:"):
+                            total += int(line.split()[1])
+                            break
+                except OSError:
+                    continue
+            return total
+        try:
+            r = subprocess.run(["ps", "-o", "rss=", "-p", ",".join(map(str, pids))], capture_output=True, text=True, timeout=2)
+        except subprocess.TimeoutExpired:
+            return None
+        return sum(int(x) for x in r.stdout.split() if x.isdigit())
+
+    def sample(self) -> None:
+        pids = self.descendants()
+        total = self.rss_kib(pids)
+        if total is None:
+            self.failures += 1
+            return
+        self.samples += 1
+        self.peak_kib = max(self.peak_kib, total)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.join(timeout=5)
+
+
+def measure(cmd: list[str], cwd: Path, env: dict[str, str], logfile: Path) -> dict:
+    """Run one command: wall time, the children's CPU time (rusage) and the tree's peak RSS."""
+    before = resource.getrusage(resource.RUSAGE_CHILDREN)
+    t0 = time.monotonic()
+    with open(logfile, "w") as out:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=out, stderr=subprocess.STDOUT, text=True)
+        sampler = RssSampler(proc.pid)
+        sampler.start()
+        code = proc.wait()
+        sampler.stop()
+    wall = time.monotonic() - t0
+    after = resource.getrusage(resource.RUSAGE_CHILDREN)
+    maxrss = after.ru_maxrss
+    # ru_maxrss is bytes on macOS and KiB on Linux.
+    max_process_mib = maxrss / 2**20 if platform.system() == "Darwin" else maxrss / 1024
+    if sampler.samples == 0:
+        log("  no memory sample succeeded; peak_rss_mib is the largest single process (rusage)")
+    return {
+        "exit": code,
+        "wall_s": round(wall, 3),
+        "user_s": round(after.ru_utime - before.ru_utime, 3),
+        "sys_s": round(after.ru_stime - before.ru_stime, 3),
+        "peak_rss_mib": round(max(sampler.peak_kib / 1024, max_process_mib), 1),
+        "max_process_rss_mib": round(max_process_mib, 1),
+        "rss_samples": sampler.samples,
+    }
+
+
+# --- cargo's timing report ----------------------------------------------------------------
+
+
+def newest_timing_report(target: Path, after: float) -> Path | None:
+    reports = [p for p in (target / "cargo-timings").glob("cargo-timing-*.html") if p.stat().st_mtime >= after - 1]
+    return max(reports, key=lambda p: p.stat().st_mtime) if reports else None
+
+
+def parse_timing_report(path: Path) -> dict:
+    """The unit, concurrency and CPU data cargo embeds as JSON in its HTML report.
+
+    Current cargo (stable 1.99 and the 2026-10 nightlies) takes `--timings` without a value and
+    writes only this report; `--timings=json` is gone. The arrays are the same data the HTML
+    charts draw from.
+    """
+    html = path.read_text()
+
+    def array(name: str):
+        i = html.index(f"const {name} = ")
+        j = html.index(";", i)
+        return json.loads(html[i + len(f"const {name} = ") : j])
+
+    summary = {}
+    for key, val in re.findall(r"<tr>\s*<td>(.*?)</td>\s*<td>(.*?)</td>", html, re.S):
+        k = re.sub("<[^>]+>", "", key).strip().rstrip(":")
+        v = re.sub("<[^>]+>", "", val).strip()
+        if k in ("Total units", "Fresh units", "Dirty units", "Max concurrency", "Total time", "rustc", "Profile"):
+            summary[k] = v
+    m = re.search(r"jobs=(\d+)\s+ncpu=(\d+)", summary.get("Max concurrency", ""))
+    return {
+        "units": array("UNIT_DATA"),
+        "concurrency": array("CONCURRENCY_DATA"),
+        "cpu_usage": array("CPU_USAGE"),
+        "summary": summary,
+        "jobs": int(m.group(1)) if m else None,
+        "ncpu": int(m.group(2)) if m else None,
+    }
+
+
+def workspace_member_names(cargo: list[str], cwd: Path, env: dict[str, str]) -> set[str]:
+    r = run(cargo + ["metadata", "--format-version", "1", "--no-deps"], cwd=cwd, env=env)
+    if r.returncode:
+        return set()
+    return {p["name"] for p in json.loads(r.stdout)["packages"]}
+
+
+def sections(u: dict) -> tuple[float, float]:
+    """(front end, codegen) seconds of one unit, from the sections cargo records when rustc
+    reports the moment its metadata is ready; (duration, 0) when it did not."""
+    secs = u.get("sections") or []
+    fe = cg = 0.0
+    for name, span in secs:
+        length = max(0.0, float(span["end"]) - float(span["start"]))
+        if name == "frontend":
+            fe += length
+        elif name == "codegen":
+            cg += length
+    if not secs:
+        fe = float(u.get("duration", 0.0))
+    return fe, cg
+
+
+def classify_units(units: list[dict], members: set[str]) -> dict:
+    """Slot-seconds per hypothesis from the unit data (plan §4, design §2).
+
+    Build scripts (compiling and running them) and proc-macro crates -> proc_macro_build_rs;
+    other non-member units -> deps; member units -> workspace, split into front end and
+    codegen by the unit's sections. `all_front_end` / `all_codegen` are the same split over
+    every compiled unit, dependencies included (hypotheses 3 and 4 across the whole build).
+    """
+    out = {"deps": 0.0, "proc_macro_build_rs": 0.0, "workspace": 0.0, "ws_front_end": 0.0, "ws_codegen": 0.0,
+           "all_front_end": 0.0, "all_codegen": 0.0, "test_binaries": 0, "units": len(units)}
+    for u in units:
+        target = u.get("target", "")
+        d = float(u.get("duration", 0.0))
+        if u.get("mode") == "run-custom-build" or "build-script" in target or "proc-macro" in target:
+            out["proc_macro_build_rs"] += d
+            continue
+        fe, cg = sections(u)
+        out["all_front_end"] += fe
+        out["all_codegen"] += cg
+        if u.get("name") in members:
+            out["workspace"] += d
+            out["ws_front_end"] += fe
+            out["ws_codegen"] += cg
+            if "(test)" in target:
+                out["test_binaries"] += 1
+        else:
+            out["deps"] += d
+    return out
+
+
+def deps_finished_at(units: list[dict], members: set[str]) -> float:
+    ends = [u["start"] + u["duration"] for u in units if u.get("name") not in members]
+    return round(max(ends), 3) if ends else 0.0
+
+
+def idle_slot_seconds(concurrency: list[dict], jobs: int, wall: float) -> float:
+    """Job slots that sat empty, integrated over the build (design §2 hypothesis 7).
+
+    cargo samples the counts when a unit starts or ends, the first time at the first such
+    event; before it, every slot is taken to be as busy as at that first sample.
+    """
+    if not concurrency or not jobs:
+        return 0.0
+    first = {"t": 0.0, "active": concurrency[0]["active"]}
+    points = [first] + concurrency + [{"t": wall, "active": 0}]
+    total = 0.0
+    for a, b in zip(points, points[1:]):
+        dt_ = max(0.0, b["t"] - a["t"])
+        total += max(0, jobs - a["active"]) * dt_
+    return total
+
+
+# --- rustc self-profile (nightly) -----------------------------------------------------------
+
+
+def summarize_profiles(prof_dir: Path) -> dict | None:
+    """Per-crate self time by phase, from measureme's `summarize --json`."""
+    summarize = shutil.which("summarize")
+    files = sorted(prof_dir.glob("*.mm_profdata"))
+    if not files:
+        return None
+    if not summarize:
+        log("summarize (cargo install --git https://github.com/rust-lang/measureme summarize) is not on PATH; no phase split")
+        return {"error": "summarize not installed", "profiles": len(files)}
+    per_crate: dict[str, dict[str, float]] = {}
+    for f in files:
+        prefix = str(f)[: -len(".mm_profdata")]
+        r = run([summarize, "summarize", "--json", prefix])
+        if r.returncode:
+            continue
+        js = Path(prefix + ".json")
+        if not js.exists():
+            continue
+        data = json.loads(js.read_text())
+        crate = f.name.rsplit("-", 1)[0]
+        phases = per_crate.setdefault(crate, {"front_end": 0.0, "codegen": 0.0, "debuginfo": 0.0, "link": 0.0, "total": 0.0})
+        for q in data.get("query_data", []):
+            st = q["self_time"]["secs"] + q["self_time"]["nanos"] / 1e9
+            label = q["label"]
+            for phase, pat in PHASE_PATTERNS:
+                if pat.search(label):
+                    phases[phase] += st
+                    break
+            else:
+                phases["front_end"] += st
+            phases["total"] += st
+    return {"profiles": len(files), "crates": per_crate}
+
+
+# --- one run -------------------------------------------------------------------------------
+
+
+def cargo_env(base: dict[str, str], config: str, target: Path, prof_dir: Path | None) -> dict[str, str]:
+    env = dict(base)
+    env["CARGO_TARGET_DIR"] = str(target)
+    env.pop("RUSTC_WRAPPER", None)  # no build cache in the baseline (plan §6)
+    env.pop("RUSTC_WORKSPACE_WRAPPER", None)
+    env["CARGO_TERM_COLOR"] = "never"
+    rustflags = list(CONFIGS[config][1])
+    if prof_dir is not None:
+        rustflags.append(f"-Zself-profile={prof_dir}")
+    if rustflags:
+        env["RUSTFLAGS"] = (env.get("RUSTFLAGS", "") + " " + " ".join(rustflags)).strip()
+    env.update(CONFIGS[config][2])
+    return env
+
+
+def touch(path: Path, marker: str) -> None:
+    with open(path, "a") as f:
+        f.write(f"\n// qrc-bench {marker}\n")
+
+
+def restore(wsdir: Path, rel: str) -> None:
+    run(["git", "checkout", "--", rel], cwd=wsdir)
+
+
+def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
+    ws, wsdir, cargo, config = ctx["ws"], ctx["wsdir"], ctx["cargo"], ctx["config"]
+    jobs: int = ctx["jobs"]
+    target: Path = wsdir / "target"
+    raw = ctx["raw"] / scenario / f"run-{index}"
+    if raw.exists():
+        shutil.rmtree(raw)
+    raw.mkdir(parents=True)
+    # The timed command never carries -Zself-profile: writing the profile data inflates wall
+    # time (ripgrep's cold build went from 7 s to 11 s with it on), and the flag is part of
+    # RUSTFLAGS, so it also decides what a warm build sees as fresh. The phase data for the
+    # cold scenarios comes from one extra, untimed, profiled build after the timed one.
+    env = cargo_env(ctx["env"], config, target, None)
+    base_cmd = cargo + ["--offline"] if ctx["offline"] else cargo
+    profiled = CONFIGS[config][0] and scenario in ("cold-build", "deps-only", "cold-test", "check")
+
+    def clean() -> None:
+        if target.exists():
+            shutil.rmtree(target)
+
+    # Every scenario covers the whole workspace (`--workspace`), as CI does; a root package
+    # with members would otherwise build only itself and its dependencies.
+    build = ["build", "--workspace", "--timings", "-j", str(jobs)]
+
+    def warm() -> None:
+        """An untimed build first, whatever the target dir holds: a previous scenario may have
+        left check artifacts or a test profile there, which look warm and are not. Same env
+        as the timed build, so its fingerprints are the ones the timed build sees."""
+        log(f"  warm-up build for {scenario} (untimed)")
+        r = run(base_cmd + ["build", "--workspace", "-j", str(jobs)], cwd=wsdir, env=env)
+        if r.returncode:
+            sys.exit(f"warm-up build failed:\n{r.stderr[-2000:]}")
+
+    timed_cmd: list[str]
+    touched: str | None = None
+    if scenario in ("cold-build", "deps-only"):
+        clean()
+        timed_cmd = base_cmd + build
+    elif scenario == "cold-test":
+        clean()
+        timed_cmd = base_cmd + ["test", "--workspace", "--no-run", "--timings", "-j", str(jobs)]
+    elif scenario == "check":
+        clean()
+        timed_cmd = base_cmd + ["check", "--workspace", "--timings", "-j", str(jobs)]
+    elif scenario == "noop":
+        warm()
+        timed_cmd = base_cmd + build
+    elif scenario in ("touch-leaf", "touch-core"):
+        warm()
+        touched = ws["touch_leaf"] if scenario == "touch-leaf" else ws["touch_core"]
+        touch(wsdir / touched, f"{scenario} run {index} {time.time():.0f}")
+        timed_cmd = base_cmd + build
+    else:
+        sys.exit(f"unknown scenario {scenario}")
+
+    started = time.time()
+    log(f"  {scenario} run {index}: {' '.join(timed_cmd[1:])}")
+    m = measure(timed_cmd, wsdir, env, raw / "cargo.log")
+    if touched:
+        restore(wsdir, touched)
+    if m["exit"] != 0:
+        log(f"  cargo exited {m['exit']}; see {raw / 'cargo.log'}")
+        return [{"schema": SCHEMA, "workspace": ws["name"], "scenario": scenario, "config": config, "run": index,
+                 "error": f"cargo exited {m['exit']}", "log": str(raw / "cargo.log")}]
+
+    report = newest_timing_report(target, started)
+    timing = parse_timing_report(report) if report else None
+    if report:
+        shutil.copy(report, raw / "cargo-timing.html")
+    members = ctx["members"]
+    record = base_record(ctx, scenario, index, m)
+    if timing:
+        cls = classify_units(timing["units"], members)
+        capacity = m["wall_s"] * jobs
+        idle = idle_slot_seconds(timing["concurrency"], jobs, m["wall_s"])
+        record["units"] = cls["units"]
+        record["test_binaries"] = cls["test_binaries"]
+        # Fractions of the build's slot capacity (wall time x jobs). deps and the build-script /
+        # proc-macro bucket come from cargo's unit data; the workspace's own units are split into
+        # front end and codegen by cargo's sections; link and debuginfo come from rustc's
+        # self-profile (nightly only) and are taken out of codegen, which contains them in the
+        # sections view. What is left of the capacity is idle: slots with nothing to run.
+        share = {
+            "deps": round(cls["deps"] / capacity, 4),
+            "proc_macro_build_rs": round(cls["proc_macro_build_rs"] / capacity, 4),
+            "front_end": round(cls["ws_front_end"] / capacity, 4),
+            "codegen": round(cls["ws_codegen"] / capacity, 4),
+            "debuginfo": None,
+            "link": None,
+            "idle": round(idle / capacity, 4),
+        }
+        record["workspace_share"] = round(cls["workspace"] / capacity, 4)
+        all_compiled = cls["all_front_end"] + cls["all_codegen"]
+        record["sections_all_crates"] = {
+            "front_end": round(cls["all_front_end"] / all_compiled, 4) if all_compiled else None,
+            "codegen": round(cls["all_codegen"] / all_compiled, 4) if all_compiled else None,
+        }
+        record["cpu_utilization"] = round((m["user_s"] + m["sys_s"]) / capacity, 4) if capacity else None
+        record["timings_summary"] = timing["summary"]
+        # Both read the timed build's target dir, so they come before the profiled pass,
+        # which cleans it and rebuilds with other flags.
+        record["target_dir_mib"] = target_mib(target)
+        if scenario == "cold-test":
+            record["test_run"] = time_test_run(ctx, base_cmd, env, jobs, raw)
+        if profiled:
+            prof = profile_pass(ctx, scenario, timed_cmd, raw, clean)
+            if prof and "crates" in prof:
+                member_ids = {mname.replace("-", "_") for mname in members}
+                ws_phases = {k: 0.0 for k in ("front_end", "codegen", "debuginfo", "link")}
+                all_phases = {k: 0.0 for k in ("front_end", "codegen", "debuginfo", "link", "total")}
+                for crate, ph in prof["crates"].items():
+                    for k in all_phases:
+                        all_phases[k] += ph[k]
+                    if crate.replace("-", "_") in member_ids:
+                        for k in ws_phases:
+                            ws_phases[k] += ph[k]
+                share["link"] = round(ws_phases["link"] / capacity, 4)
+                share["debuginfo"] = round(ws_phases["debuginfo"] / capacity, 4)
+                share["codegen"] = round(max(0.0, cls["ws_codegen"] - ws_phases["link"] - ws_phases["debuginfo"]) / capacity, 4)
+                t = all_phases["total"] or 1.0
+                record["phase_all_crates"] = {k: round(all_phases[k] / t, 4) for k in ("front_end", "codegen", "debuginfo", "link")}
+                record["self_profile"] = {"profiles": prof["profiles"], "crates": len(prof["crates"]), "wall_s": prof.get("wall_s")}
+            elif prof:
+                record["self_profile"] = prof
+        record["share"] = share
+        record["share_sum"] = round(sum(v for v in share.values() if v is not None), 4)
+    else:
+        record["target_dir_mib"] = target_mib(target)
+    out = [record]
+    if scenario == "deps-only" and timing:
+        derived = base_record(ctx, "deps-only", index, m)
+        derived.update({
+            "derived_from": "cold-build",
+            "wall_s": deps_finished_at(timing["units"], members),
+            "user_s": None, "sys_s": None, "peak_rss_mib": None, "max_process_rss_mib": None,
+            "units": sum(1 for u in timing["units"] if u.get("name") not in members),
+            "dep_slot_seconds": round(classify_units(timing["units"], members)["deps"], 3),
+        })
+        record["scenario"] = "cold-build"
+        out.append(derived)
+    return out
+
+
+def profile_pass(ctx: dict, scenario: str, timed_cmd: list[str], raw: Path, clean) -> dict | None:
+    """The same cold command once more, untimed, with -Zself-profile, for the phase split.
+
+    The profile directory is one fixed path per configuration (it is part of RUSTFLAGS), and
+    the trace files are moved into the run's directory and summarized from there. The build
+    it leaves behind has different flags from the timed one; the next scenario cleans or
+    warms the target directory before it measures anything.
+    """
+    prof_dir = ctx["raw"] / "self-profile"
+    shutil.rmtree(prof_dir, ignore_errors=True)
+    prof_dir.mkdir(parents=True)
+    env = cargo_env(ctx["env"], ctx["config"], ctx["wsdir"] / "target", prof_dir)
+    cmd = [a for a in timed_cmd if a != "--timings"]
+    clean()
+    log(f"  {scenario}: profiled build (untimed, -Zself-profile)")
+    t0 = time.monotonic()
+    r = run(cmd, cwd=ctx["wsdir"], env=env)
+    wall = round(time.monotonic() - t0, 3)
+    if r.returncode:
+        log(f"  profiled build exited {r.returncode}; no phase split for this run")
+        return {"error": f"profiled build exited {r.returncode}"}
+    run_prof = raw / "self-profile"
+    shutil.move(str(prof_dir), str(run_prof))
+    prof = summarize_profiles(run_prof)
+    if prof is not None:
+        prof["wall_s"] = wall
+    if not ctx["keep_traces"]:
+        # The binary traces run to tens of megabytes per crate; summarize's JSON beside each
+        # one keeps every number the record uses.
+        for f in run_prof.glob("*.mm_profdata"):
+            f.unlink()
+    return prof
+
+
+def target_mib(target: Path) -> int:
+    du = run(["du", "-sm", str(target)]).stdout.split()
+    return int(du[0]) if du and du[0].isdigit() else 0
+
+
+def time_test_run(ctx: dict, base_cmd: list[str], env: dict[str, str], jobs: int, raw: Path) -> dict:
+    """The test run itself, timed separately from its build (plan §2 cold-test)."""
+    nextest = run(ctx["cargo"] + ["nextest", "--version"]).returncode == 0
+    cmd = base_cmd + (["nextest", "run", "--workspace", "-j", str(jobs)] if nextest else ["test", "--workspace", "-j", str(jobs)])
+    m = measure(cmd, ctx["wsdir"], env, raw / "test-run.log")
+    return {"runner": "nextest" if nextest else "cargo test", **{k: m[k] for k in ("exit", "wall_s", "user_s", "sys_s", "peak_rss_mib")}}
+
+
+def base_record(ctx: dict, scenario: str, index: int, m: dict) -> dict:
+    ws = ctx["ws"]
+    return {
+        "schema": SCHEMA,
+        "workspace": f"{ws['repo'].split('github.com/')[-1]}",
+        "commit": ws["commit"],
+        "scenario": scenario,
+        "config": ctx["config"],
+        "run": index,
+        "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "toolchain": {**ctx["toolchain"], "linker": ctx["linker"]},
+        "machine": ctx["machine"],
+        "wall_s": m["wall_s"],
+        "user_s": m["user_s"],
+        "sys_s": m["sys_s"],
+        "peak_rss_mib": m["peak_rss_mib"],
+        "max_process_rss_mib": m["max_process_rss_mib"],
+        "rss_samples": m["rss_samples"],
+        "units": 0,
+        "test_binaries": 0,
+        "target_dir_mib": 0,
+        "share": None,
+    }
+
+
+# --- main ----------------------------------------------------------------------------------
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("workspace", nargs="?", help="a workspace name from the corpus")
+    ap.add_argument("--corpus", type=Path, default=HERE / "corpus.toml")
+    ap.add_argument("--work", type=Path, default=Path(os.environ.get("QRC_BENCH_WORK", Path.home() / "qrc-bench")),
+                    help="disk-backed directory the workspaces are fetched into (never /tmp; plan §6)")
+    ap.add_argument("--config", default="baseline-stable", choices=sorted(CONFIGS))
+    ap.add_argument("--scenarios", default="all", help="comma-separated, or `all`")
+    ap.add_argument("--runs", type=int, default=3, help="runs per scenario (plan §2: 3, or 5 when variance is above 5 percent)")
+    ap.add_argument("--jobs", type=int, default=0, help="cargo -j (default: the core count); always recorded")
+    ap.add_argument("--results", type=Path, help="JSONL file to append to (default: bench/results/<date>-<label>.jsonl)")
+    ap.add_argument("--label", help="a short machine label for the results (default: the CPU model, slugified)")
+    ap.add_argument("--raw", type=Path, default=HERE / "results" / "raw", help="where traces and logs go (git-ignored)")
+    ap.add_argument("--online", action="store_true", help="let the timed cargo runs reach the network (default: --offline after one untimed `cargo fetch`)")
+    ap.add_argument("--keep-traces", action="store_true", help="keep the binary self-profile traces (default: delete them once summarized)")
+    ap.add_argument("--list", action="store_true", help="list workspaces, scenarios and configurations")
+    args = ap.parse_args()
+
+    corpus = load_corpus(args.corpus)
+    if args.list or not args.workspace:
+        print("workspaces:   " + ", ".join(ws["name"] for ws in corpus["workspace"]))
+        print("scenarios:    " + ", ".join(SCENARIOS))
+        print("configs:      " + ", ".join(f"{k}{'' if i < 2 else ' (Phase 1)'}" for i, k in enumerate(CONFIGS)))
+        return 0 if args.list else 2
+
+    ws = workspace(corpus, args.workspace)
+    scenarios = list(SCENARIOS) if args.scenarios == "all" else args.scenarios.split(",")
+    for s in scenarios:
+        if s not in SCENARIOS:
+            sys.exit(f"unknown scenario `{s}`; --list shows them")
+    if "deps-only" in scenarios and "cold-build" in scenarios:
+        scenarios.remove("cold-build")  # deps-only is derived from the same cold build
+    jobs = args.jobs or os.cpu_count() or 1
+    if str(args.work).startswith("/tmp"):
+        sys.exit("--work must not be under /tmp (plan §6)")
+    args.work.mkdir(parents=True, exist_ok=True)
+
+    wsdir = fetch(ws, args.work)
+    tc = toolchain_for(ws, corpus, args.config)
+    toolchain = ensure_toolchain(tc, args.config)
+    cargo = ["cargo", f"+{tc}"]
+    env = dict(os.environ)
+    members = workspace_member_names(cargo, wsdir, env)
+    if not members:
+        sys.exit("cargo metadata gave no workspace members")
+    # The registry index and every crate the lockfile names, fetched once and untimed, so that
+    # no timed run contains a download; the timed runs then pass --offline unless --online.
+    log("cargo fetch (untimed)")
+    r = run(cargo + ["fetch", "--locked"], cwd=wsdir, env=env)
+    if r.returncode:
+        sys.exit(f"cargo fetch failed: {r.stderr[-1500:]}")
+    machine = machine_info(jobs, args.label)
+    results = args.results or HERE / "results" / f"{dt.date.today().isoformat()}-{machine['label']}.jsonl"
+    results.parent.mkdir(parents=True, exist_ok=True)
+    raw = args.raw / ws["name"] / args.config
+    ctx = {
+        "ws": ws, "wsdir": wsdir, "cargo": cargo, "config": args.config, "jobs": jobs, "env": env,
+        "members": members, "toolchain": toolchain, "linker": linker_info(CONFIGS[args.config][1]),
+        "machine": machine, "raw": raw, "offline": not args.online, "keep_traces": args.keep_traces,
+    }
+    log(f"{ws['name']} @ {ws['commit'][:8]} | {args.config} | {toolchain['rustc']} | -j {jobs} | {machine['cpu']}, {machine['cores']} cores, {machine['ram_gib']} GiB")
+    log(f"results -> {results}; raw -> {raw}")
+    with open(results, "a") as out:
+        for scenario in scenarios:
+            for i in range(1, args.runs + 1):
+                for rec in one_run(ctx, scenario, i):
+                    out.write(json.dumps(rec, sort_keys=True) + "\n")
+                    out.flush()
+                    if "error" in rec:
+                        log(f"  -> {rec['scenario']} run {i}: FAILED ({rec['error']})")
+                    else:
+                        sh = rec.get("share") or {}
+                        log(f"  -> {rec['scenario']} run {i}: wall {rec['wall_s']}s cpu {rec.get('user_s')}+{rec.get('sys_s')}s "
+                            f"peak {rec.get('peak_rss_mib')} MiB units {rec.get('units')} "
+                            f"deps {sh.get('deps')} pm {sh.get('proc_macro_build_rs')} idle {sh.get('idle')}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
