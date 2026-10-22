@@ -27,6 +27,8 @@ from collections import defaultdict
 from pathlib import Path
 from xml.sax.saxutils import escape
 
+import critical_path
+
 HERE = Path(__file__).resolve().parent
 SHARE_KEYS = ("deps", "proc_macro_build_rs", "front_end", "codegen", "debuginfo", "link", "idle")
 HYPOTHESIS = {
@@ -325,6 +327,9 @@ def report(rows: list[dict], preamble: str = "", charts: dict[tuple[str, str, st
             out.append("")
             out.extend(scenario_table(by_scenario))
             out.append("")
+            cp_lines = critical_path.report_lines(by_scenario)
+            if cp_lines:
+                out.extend(cp_lines + [""])
             for scenario in COLD:
                 runs = share_runs(by_scenario, scenario)
                 if not runs:
@@ -408,7 +413,8 @@ def self_test() -> int:
         written = write_charts(rows, root / "charts")
         first = ("example/ws", "baseline-stable on fixture (-j 8)", "cold-build")
         second = ("example/ws", "baseline-stable on fixture-2 (-j 8)", "cold-build")
-        assert sorted(written) == [first, second], written
+        cold_test = ("example/ws", "baseline-stable on fixture (-j 8)", "cold-test")
+        assert sorted(written) == [first, cold_test, second], written
         assert written[first] == root / "charts" / "example-ws-baseline-stable-on-fixture-j-8-cold-build.svg", written
         assert all(p.is_file() for p in written.values()), written
         svg = written[first].read_text(encoding="utf-8")

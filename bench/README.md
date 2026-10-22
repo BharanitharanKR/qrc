@@ -65,6 +65,29 @@ Shares are fractions of the build's slot capacity (wall time x jobs), so with id
 up to about 1.0; `share_sum` records how close. `sections_all_crates` gives the front end
 versus codegen split over every compiled crate, dependencies included.
 
+### Critical path
+
+For the cold scenarios (`cold-build`, `cold-test`, `check`) the record also carries the build's
+critical path, worked out by [`critical_path.py`](critical_path.py) from the same timing data, as
+an input for Layer 3's scheduler (design §6; plan §4 names `--unit-graph` for it). cargo notes,
+for each unit, the units its completion released (`unblocked_units`) and the ones its metadata
+released (`unblocked_rmeta_units`, pipelining). Those edges, weighted by each unit's duration, or
+by its time to `.rmeta` on a metadata edge, give the longest chain of dependent work. Its length
+is the wall time the build could not beat with unlimited jobs, and the total unit time divided by
+it is the parallelism bound, the number of job slots the build keeps busy on average in that
+ideal. What separates it from the wall time is waiting: units released but held for a job slot,
+and cargo's own work before the first unit and after the last. Two limits. cargo records only the
+dependency that released each unit, not all of them, so the path is a lower bound on the longest
+path of the full unit graph. And a unit's `duration` starts when cargo gives it a job slot but
+includes everything after that, contention with the units beside it included, so the durations
+are those of this build at this `-j`. The module docstring has the full model.
+
+`analyze.py` prints one line per cold scenario: the critical path, its share of the wall time,
+the number of units on it and the longest of them.
+`python3 bench/critical_path.py <cargo-timing.html>` prints the whole path from a raw report, with
+each unit's ideal and actual start, and `python3 bench/critical_path.py --self-test` checks the
+computation on synthetic unit data (CI runs it with the other self-tests).
+
 ### Fields beyond the plan's schema
 
 The record carries every field of the plan's example (§4) and these beside them:
@@ -79,6 +102,7 @@ The record carries every field of the plan's example (§4) and these beside them
 | `workspace_share` | slot-seconds of the workspace's own units, before the front end / codegen split |
 | `share_sum` | the sum of the non-null shares; how close the attribution comes to 1.0 |
 | `sections_all_crates` | front end and codegen as fractions of compile time over every crate, dependencies included |
+| `critical_path` | cold scenarios only: the longest chain of units in cargo's timings ([Critical path](#critical-path)): its length in `seconds`, the `units` on it, `rmeta_links` (links where the next unit waited only for `.rmeta`), `total_unit_s`, `parallelism` (`total_unit_s` / `seconds`), `ends_at_last_unit` (false when the unit that finished last waited for a slot on a shorter chain), and `top`, the five units with the most time on the path (`name`, `version`, `target`, `duration_s`, `path_s`, `waited_on`); `{"error": ...}` when the unit data is malformed or not a DAG |
 | `phase_all_crates`, `self_profile` | nightly only: the self-profile split over every crate, and the profiled build's crate count and wall time |
 | `timings_summary` | cargo's own summary rows (total, fresh and dirty units, max concurrency, total time) |
 | `size_facts` | the corpus's size facts measured from the checkout (see [Corpus](#corpus)) |

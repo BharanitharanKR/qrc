@@ -36,6 +36,8 @@ import time
 import tomllib
 from pathlib import Path
 
+import critical_path
+
 SCHEMA = 1
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
@@ -615,6 +617,8 @@ def one_run(ctx: dict, scenario: str, index: int) -> list[dict]:
         }
         record["cpu_utilization"] = round((m["user_s"] + m["sys_s"]) / capacity, 4) if capacity else None
         record["timings_summary"] = timing["summary"]
+        if scenario in critical_path.COLD_SCENARIOS:
+            record["critical_path"] = critical_path.summary(timing["units"])
         # Both read the timed build's target dir, so they come before the profiled pass,
         # which cleans it and rebuilds with other flags.
         record["target_dir_mib"] = target_mib(target)
