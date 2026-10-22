@@ -31,6 +31,15 @@ The name and email must match the commit author. A CI check (`DCO sign-off`) rej
 requests with unsigned commits. To fix an unsigned commit, amend it with `git commit --amend -s`
 (or `git rebase --signoff` for several commits) and force-push your branch.
 
+## Code review
+
+Every pull request gets one AI reviewer, never two. In this repository it is
+[Greptile](https://www.greptile.com), configured in [`.greptile/`](.greptile/config.json); it
+reviews pull requests into `main` when they are opened (comment `@greptileai` to re-run it).
+CodeRabbit's automatic review is off ([`.coderabbit.yaml`](.coderabbit.yaml)); it runs only if
+someone comments `@coderabbitai review`. A maintainer reviews after the bot. Answer each bot
+comment; it is fine to disagree and say why.
+
 ## Licence of contributions
 
 qrc is dual-licensed under [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE). Unless you
