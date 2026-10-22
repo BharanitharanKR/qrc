@@ -66,6 +66,7 @@ jobs:
           python3 bench/run.py --list
           python3 bench/run.py --self-test
           python3 bench/analyze.py --self-test
+          python3 bench/critical_path.py --self-test
 
   shell:
     name: Shell check
