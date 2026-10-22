@@ -15,6 +15,7 @@ to validate.
 
 - Design: [docs/design.md](docs/design.md) (owner draft v0.2, fact-checked)
 - Phase 0 plan: [docs/phase-0.md](docs/phase-0.md)
+- Shared build cache over Tailscale (plan): [docs/tailscale-shared-cache.md](docs/tailscale-shared-cache.md)
 
 ## The two-lane principle
 
@@ -35,7 +36,7 @@ Nothing gets built before Phase 0 shows where the time actually goes.
 | Layer | What | Size |
 |---|---|---|
 | 1. Zero-new-code wins | Config bundle: cranelift backend for dev, less debug info, fast linker, nextest, fewer test binaries | days |
-| 2. Adopt an existing cache | Benchmark kache against sccache, add a prebuilt dependency layer and a remote store. Adopt, do not rebuild | days |
+| 2. Adopt an existing cache | Benchmark kache against sccache, add a prebuilt dependency layer and a remote store (plan: [Tailscale shared cache](docs/tailscale-shared-cache.md)). Adopt, do not rebuild | days |
 | 3. `qrcd` orchestrator | Cache-aware scheduling, `.rmeta` pipelining, critical-path scheduling, warm daemon state | weeks to months |
 | 4. Fast backend | cg_clif tuning first, then TPDE evaluation; a custom single-pass backend only if needed | months |
 | 5. Linking | mold/wild by default, fewer test binaries; an own linker only if profiling demands it | optional |
@@ -46,7 +47,7 @@ Nothing gets built before Phase 0 shows where the time actually goes.
 |---|---|---|
 | 0 (week 0 to 1) | Benchmark corpus (3 to 5 real workspaces), profiling harness | Time-share breakdown per workload |
 | 1 (week 1 to 2) | Layer 1 config bundle, `qrc init` that writes it | Documented speedup |
-| 2 (weeks 2 to 3) | Adopt and benchmark kache/sccache, dependency layer, remote store | Cold CI restores from cache; determinism check passes |
+| 2 (weeks 2 to 3) | Adopt and benchmark kache/sccache, dependency layer, remote store ([Tailscale plan](docs/tailscale-shared-cache.md)) | Cold CI restores from cache; determinism check passes |
 | 3 (weeks 3 to 10) | `qrcd` scheduler, cache-aware scheduling, pipelining | Better CPU utilization than plain cargo |
 | 4 (from week 10) | cg_clif tuning, TPDE evaluation, optional custom backend | Beats cranelift by a clear margin on the corpus |
 | 5 (optional) | Own linker, or a lighter front end | Only if profiling justifies it |
