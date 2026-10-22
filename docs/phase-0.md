@@ -10,7 +10,7 @@ CPU time goes to each of the seven hypotheses in design §2.
 ## 1. Benchmark corpus
 
 Three to five real workspaces of varied size. Each one is pinned to an exact commit and toolchain,
-recorded in `bench/corpus.toml` (to be written), so runs are repeatable.
+recorded in [`bench/corpus.toml`](../bench/corpus.toml), so runs are repeatable.
 
 | Workspace | Why it is in the corpus | Rough shape |
 |---|---|---|
