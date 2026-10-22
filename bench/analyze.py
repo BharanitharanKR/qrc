@@ -84,6 +84,11 @@ def group(rows: list[dict]) -> dict:
     return g
 
 
+def _test_run_exit(r: dict) -> int | None:
+    """The test run's exit code, when the scenario ran the tests after building them."""
+    return (r.get("test_run") or {}).get("exit")
+
+
 def scenario_table(by_scenario: dict) -> list[str]:
     lines = ["| Scenario | Runs | Wall (median) | Spread | CPU time (user+sys) | CPU use | Peak RSS | Units | Test binaries |",
              "|---|---|---|---|---|---|---|---|---|"]
@@ -100,11 +105,17 @@ def scenario_table(by_scenario: dict) -> list[str]:
         # spread is scheduler noise measured in tens of milliseconds.
         wide = sp is not None and sp > 0.05 and (max(walls) - min(walls)) > 0.2
         flag = " (above 5%: run 5)" if wide and len(runs) < 5 else ""
+        # Built test binaries tell nothing about whether the tests ran: a cold-test row whose test
+        # run exited non-zero is marked, and the runs themselves are listed under the tables.
+        test_failed = sum(1 for r in runs if _test_run_exit(r) not in (None, 0))
+        bins = fmt(median([r.get("test_binaries") for r in runs]), 0)
+        if test_failed:
+            bins += f" ({test_failed} test runs failed)"
         lines.append(
             f"| {s} | {len(runs)}{' (+%d failed)' % errors if errors else ''} | {fmt(median(walls), 2, ' s')} | "
             f"{pct(sp)}{flag} | {fmt(median(cpu), 1, ' s')} | {pct(median([r.get('cpu_utilization') for r in runs]))} | "
             f"{fmt(median([r.get('peak_rss_mib') for r in runs]), 0, ' MiB')} | {fmt(median([r.get('units') for r in runs]), 0)} | "
-            f"{fmt(median([r.get('test_binaries') for r in runs]), 0)} |"
+            f"{bins} |"
         )
     return lines
 
@@ -184,6 +195,17 @@ def report(rows: list[dict], preamble: str = "") -> str:
         for r in failed:
             out.append(f"- {r['workspace']} {r['config']} {r['scenario']} run {r['run']}: {r['error']}")
         out.append("")
+    test_failed = [r for r in rows if _test_run_exit(r) not in (None, 0)]
+    if test_failed:
+        out.append("## Test runs that failed")
+        out.append("")
+        out.append("A cold-test row times the build of the test binaries; the test run is timed separately and "
+                   "does not affect those numbers. These test runs exited non-zero, so the row says the binaries "
+                   "built, not that the suite passed:")
+        out.append("")
+        for r in test_failed:
+            out.append(f"- {r['workspace']} {r['config']} cold-test run {r['run']}: exit {_test_run_exit(r)}")
+        out.append("")
     return "\n".join(out)
 
 
@@ -205,6 +227,10 @@ def self_test() -> int:
     assert "Failed runs" in text and "run 1: cargo exited 101" in text
     # A failed run is counted in its own scenario row, under the same workspace and setting.
     assert "| check | 0 (1 failed) |" in text, text
+    # Built test binaries do not say the tests passed: a non-zero test run is marked in its row
+    # and listed under the tables.
+    assert "| 14 (1 test runs failed) |" in text, text
+    assert "Test runs that failed" in text and "cold-test run 1: exit 101" in text, text
     # A second machine is a second baseline: its 30 s run does not move the first one's median.
     assert "baseline-stable on fixture-2 (-j 8)" in g["example/ws"], list(g["example/ws"])
     assert median([r["wall_s"] for r in g["example/ws"]["baseline-stable on fixture-2 (-j 8)"]["cold-build"]]) == 30.0
