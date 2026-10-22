@@ -1,0 +1,117 @@
+# The Phase 0 benchmark corpus (docs/phase-0.md §1).
+#
+# Every workspace is pinned to an exact commit and toolchain so that a run on
+# another machine measures the same inputs. The size facts were read from each
+# repository's tree at the pinned commit on the `checked` date; the harness
+# re-measures them at run time and reports both. `scripts/check-corpus.py`
+# checks this file's shape and, with --verify-pins, that each `ref` still
+# points at its `commit`.
+#
+# Fields per workspace:
+#   name, repo, ref, commit, date   the pin: a release tag (or branch) and the commit it names
+#   toolchain                       the stable version the workspace's rust-toolchain.toml pins,
+#                                   or the stable current on `checked` when it has none
+#   shape, why                      the plan's "rough shape" and "why it is in the corpus"
+#   manifests                       Cargo.toml files in the tree
+#   lock_packages                   [[package]] entries in Cargo.lock
+#   rs_files, rs_lines              .rs files and their line count (wc -l), target/ excluded
+#   integration_tests               <crate>/tests/*.rs files: an upper bound on test binaries
+#                                   from integration tests, on top of one per lib and bin
+#   build_scripts                   build.rs files
+#   touch_leaf, touch_core          the files the touch-leaf and touch-core scenarios edit (§2)
+#   system_libs                     packages a fresh Debian/Ubuntu machine needs before cargo
+#                                   can build the workspace (Linux; the harness checks for them)
+
+schema = 1
+checked = 2026-10-22
+
+[nightly]
+# The pinned nightly for `baseline-nightly` (§3): -Zself-profile and --unit-graph need it.
+channel = "nightly-2026-10-15"
+rustc = "rustc 1.101.0-nightly (7df81381d 2026-10-14)"
+
+[[workspace]]
+name = "loams"
+repo = "https://github.com/ostrium-labs/loams"
+ref = "v0.1.0"
+commit = "2589d648a67b839ef3e9a786bcd6371a805fb591"
+date = 2026-10-19
+toolchain = "1.97.1"
+shape = "Large, dependency-heavy services, many test binaries"
+why = "Our own large workspace with heavy CI (about 100 manifests, about 1,400 packages in Cargo.lock, a pinned stable toolchain, around 30 GitHub Actions workflows); CI changes can be tried on it"
+manifests = 101
+lock_packages = 1410
+rs_files = 2251
+rs_lines = 968003
+integration_tests = 281
+build_scripts = 28
+touch_leaf = "crates/loams/src/main.rs"
+touch_core = "crates/loams-meta/src/lib.rs"
+system_libs = ["protobuf-compiler", "build-essential"]
+notes = "loams-meta is the workspace crate with the most dependents (the catalog, leases and the timestamp oracle). The first build compiles DataFusion, Lance and Tantivy: budget 30 GB of disk and keep -j at 4 on machines with less than 32 GB of RAM (its CONTRIBUTING.md)."
+
+[[workspace]]
+name = "ripgrep"
+repo = "https://github.com/BurntSushi/ripgrep"
+ref = "15.2.0"
+commit = "e89fff89ac9af12e8d4ce9d5fd07beb408ca730f"
+date = 2026-07-15
+toolchain = "1.99.1"
+shape = "Small, few dependencies"
+why = "Small, well-known workspace; a floor for how much overhead can matter"
+manifests = 11
+lock_packages = 59
+rs_files = 100
+rs_lines = 53025
+integration_tests = 5
+build_scripts = 1
+touch_leaf = "crates/core/main.rs"
+touch_core = "crates/matcher/src/lib.rs"
+system_libs = []
+notes = "No rust-toolchain file (rust-version = 1.85), so the toolchain is the stable release current on the checked date. grep-matcher is depended on by the searcher, printer, regex and pcre2 crates and the binary."
+
+[[workspace]]
+name = "nushell"
+repo = "https://github.com/nushell/nushell"
+ref = "0.116.1"
+commit = "b632ef0994e07b5176ec45171e8cee2c127c5563"
+date = 2026-10-04
+toolchain = "1.96.1"
+shape = "Medium to large, many crates"
+why = "Mid-to-large workspace with many crates and plugins"
+manifests = 48
+lock_packages = 1030
+rs_files = 1944
+rs_lines = 455210
+integration_tests = 30
+build_scripts = 4
+touch_leaf = "src/main.rs"
+touch_core = "crates/nu-protocol/src/lib.rs"
+system_libs = []
+notes = "nu-protocol is the crate nearly every other nushell crate depends on. The default feature set builds without system libraries on Linux."
+
+[[workspace]]
+name = "zed"
+repo = "https://github.com/zed-industries/zed"
+ref = "v1.25.2"
+commit = "d25fa01ccd788d812f236810b71af4feff6b2e38"
+date = 2026-10-21
+toolchain = "1.98.1"
+shape = "Very large application, many crates"
+why = "Very large application workspace; the Rust project's cg_clif goal benchmarks on it, so our numbers can be compared with theirs"
+manifests = 266
+lock_packages = 1791
+rs_files = 2007
+rs_lines = 1761136
+integration_tests = 22
+build_scripts = 18
+touch_leaf = "crates/zed/src/main.rs"
+touch_core = "crates/gpui/src/gpui.rs"
+system_libs = [
+  "build-essential", "clang", "cmake", "curl", "elfutils", "g++", "gcc", "gettext-base", "git",
+  "jq", "libasound2-dev", "libfontconfig-dev", "libgit2-dev", "libglib2.0-dev", "libsqlite3-dev",
+  "libssl-dev", "libva-dev", "libvulkan1", "libwayland-dev", "libx11-xcb-dev",
+  "libxkbcommon-x11-dev", "libzstd-dev", "lld", "llvm", "make", "musl-dev", "musl-tools",
+  "pipewire", "xdg-desktop-portal",
+]
+notes = "The Debian/Ubuntu names from script/linux at the pinned commit; the same script lists the Fedora, Arch, openSUSE and Gentoo names. gpui is the UI framework every crate above it depends on; its library root is gpui.rs. Budget 40 GB of disk for a debug build."
