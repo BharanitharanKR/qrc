@@ -18,6 +18,8 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import critical_path
+
 HERE = Path(__file__).resolve().parent
 SHARE_KEYS = ("deps", "proc_macro_build_rs", "front_end", "codegen", "debuginfo", "link", "idle")
 HYPOTHESIS = {
@@ -153,6 +155,9 @@ def report(rows: list[dict], preamble: str = "") -> str:
             out.append("")
             out.extend(scenario_table(by_scenario))
             out.append("")
+            cp_lines = critical_path.report_lines(by_scenario)
+            if cp_lines:
+                out.extend(cp_lines + [""])
             for scenario in ("cold-build", "cold-test"):
                 runs = [r for r in by_scenario.get(scenario, []) if "error" not in r and r.get("share")]
                 if not runs:
