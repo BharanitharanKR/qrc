@@ -69,8 +69,9 @@ if [ -z "${STORE_URL:-}" ]; then
 fi
 ak_file="$(envval RUSTFS_ACCESS_KEY_FILE)"
 sk_file="$(envval RUSTFS_SECRET_KEY_FILE)"
-[ -r "$ak_file" ] && [ -r "$sk_file" ] || {
-  echo "RUSTFS_ACCESS_KEY_FILE and RUSTFS_SECRET_KEY_FILE in $RUSTFS_ENV must name readable files" >&2; exit 1; }
+if [ ! -r "$ak_file" ] || [ ! -r "$sk_file" ]; then
+  echo "RUSTFS_ACCESS_KEY_FILE and RUSTFS_SECRET_KEY_FILE in $RUSTFS_ENV must name readable files" >&2; exit 1
+fi
 
 # A private rc configuration for this run only, removed on exit: the admin alias
 # (which holds the root key) is never left on disk.
