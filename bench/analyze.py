@@ -40,7 +40,8 @@ HYPOTHESIS = {
     "link": "6. linking",
     "idle": "7. scheduling gaps (idle slots)",
 }
-SCENARIO_ORDER = ("cold-build", "cold-test", "check", "noop", "touch-leaf", "touch-core", "deps-only")
+SCENARIO_ORDER = ("cold-build", "cold-test", "check", "noop", "touch-leaf", "touch-core", "deps-only",
+                  "cache-cold", "cache-hit", "cache-partial", "cache-warm-local")
 BAR = "█"
 COLD = ("cold-build", "cold-test")  # the scenarios whose time share the report breaks down
 
@@ -94,9 +95,13 @@ def pct(v: float | None) -> str:
 
 def setting(r: dict) -> str:
     """The configuration a run belongs to, including the machine and -j: runs from different
-    computers or job counts are separate baselines, never one median."""
+    computers or job counts are separate baselines, never one median. So is a build through a
+    cache (Phase 2): the cache and its backend are part of the setting. Records written before
+    the `cache` field existed are uncached."""
     m = r.get("machine") or {}
-    return f"{r['config']} on {m.get('label', 'unknown machine')} (-j {m.get('jobs', '?')})"
+    cache = r.get("cache") or "none"
+    through = "" if cache == "none" else f" + {cache} ({r.get('cache_backend') or 'local'})"
+    return f"{r['config']}{through} on {m.get('label', 'unknown machine')} (-j {m.get('jobs', '?')})"
 
 
 def group(rows: list[dict]) -> dict:
@@ -113,13 +118,16 @@ def _test_run_exit(r: dict) -> int | None:
 
 
 def scenario_table(by_scenario: dict) -> list[str]:
-    lines = ["| Scenario | Runs | Wall (median) | Spread | CPU time (user+sys) | CPU use | Peak RSS | Units | Test binaries |",
-             "|---|---|---|---|---|---|---|---|---|"]
+    # A hit-rate column only where some run went through a build cache (Phase 2).
+    cached = any(r.get("cache_stats") for runs in by_scenario.values() for r in runs)
+    lines = ["| Scenario | Runs | Wall (median) | Spread | CPU time (user+sys) | CPU use | Peak RSS | Units | Test binaries |"
+             + (" Hit rate |" if cached else ""),
+             "|---|---|---|---|---|---|---|---|---|" + ("---|" if cached else "")]
     for s in sorted(by_scenario, key=lambda x: SCENARIO_ORDER.index(x) if x in SCENARIO_ORDER else 99):
         runs = [r for r in by_scenario[s] if "error" not in r]
         errors = len(by_scenario[s]) - len(runs)
         if not runs:
-            lines.append(f"| {s} | 0 ({errors} failed) | | | | | | | |")
+            lines.append(f"| {s} | 0 ({errors} failed) | | | | | | | |" + (" |" if cached else ""))
             continue
         walls = [r["wall_s"] for r in runs]
         cpu = [None if r.get("user_s") is None else r["user_s"] + r["sys_s"] for r in runs]
@@ -139,6 +147,7 @@ def scenario_table(by_scenario: dict) -> list[str]:
             f"{pct(sp)}{flag} | {fmt(median(cpu), 1, ' s')} | {pct(median([r.get('cpu_utilization') for r in runs]))} | "
             f"{fmt(median([r.get('peak_rss_mib') for r in runs]), 0, ' MiB')} | {fmt(median([r.get('units') for r in runs]), 0)} | "
             f"{bins} |"
+            + (f" {pct(median([(r.get('cache_stats') or {}).get('hit_rate') for r in runs]))} |" if cached else "")
         )
     return lines
 
@@ -316,14 +325,22 @@ def report(rows: list[dict], preamble: str = "", charts: dict[tuple[str, str, st
                "from 1.0 is the time neither source attributes. Timed runs never carry `-Zself-profile`; on nightly, "
                "the phase data comes from one extra, untimed, profiled build per cold scenario.")
     out.append("")
+    if any((r.get("cache") or "none") != "none" for r in rows):
+        out.append("Settings with `+ sccache` or `+ kache` built through that cache, with incremental compilation off "
+                   "(Phase 2, design §5); the backend is in brackets. Hit rate is hits / (hits + misses) from the "
+                   "cache's own counters for the timed build. Under sccache, rustc runs in the sccache server, outside "
+                   "cargo's process tree, so CPU time and peak RSS leave those compiles out; compare wall time.")
+        out.append("")
     for ws in sorted(g):
         out.append(f"## {ws}")
-        for config in sorted(g[ws]):
+        # Uncached settings first, then the ones through a cache.
+        for config in sorted(g[ws], key=lambda c: (" + " in c, c)):
             by_scenario = g[ws][config]
             commits = {r.get("commit", "")[:8] for r in sum(by_scenario.values(), [])}
             tcs = {r["toolchain"]["rustc"] for r in sum(by_scenario.values(), []) if "toolchain" in r}
+            tools = {r["cache_version"] for r in sum(by_scenario.values(), []) if r.get("cache_version")}
             out.append(f"### {config}")
-            out.append(f"Commit {', '.join(sorted(commits))}; {'; '.join(sorted(tcs))}")
+            out.append(f"Commit {', '.join(sorted(commits))}; {'; '.join(sorted(tcs) + sorted(tools))}")
             out.append("")
             out.extend(scenario_table(by_scenario))
             out.append("")
@@ -362,7 +379,8 @@ def report(rows: list[dict], preamble: str = "", charts: dict[tuple[str, str, st
     if failed:
         out.append("## Failed runs")
         for r in failed:
-            out.append(f"- {r['workspace']} {r['config']} {r['scenario']} run {r['run']}: {r['error']}")
+            through = "" if (r.get("cache") or "none") == "none" else f" + {r['cache']}"
+            out.append(f"- {r['workspace']} {r['config']}{through} {r['scenario']} run {r['run']}: {r['error']}")
         out.append("")
     test_failed = [r for r in rows if _test_run_exit(r) not in (None, 0)]
     if test_failed:
@@ -405,6 +423,14 @@ def self_test() -> int:
     assert median([r["wall_s"] for r in g["example/ws"]["baseline-stable on fixture-2 (-j 8)"]["cold-build"]]) == 30.0
     # Idle is hypothesis 7 and can rank: on the second machine it is the largest share.
     assert "Top hypotheses: 7. scheduling gaps (idle slots) (70%)" in text, text
+    # Phase 2: a build through a cache is a setting of its own, listed after the uncached ones,
+    # and only its table has the hit-rate column (the median of 90% and 100%).
+    cached = "baseline-stable + sccache (local) on fixture (-j 8)"
+    assert cached in g["example/ws"], list(g["example/ws"])
+    assert text.index("### baseline-stable on fixture (-j 8)") < text.index(f"### {cached}"), text
+    assert text.count("| Test binaries | Hit rate |") == 1, text
+    hit_rows = [line for line in text.splitlines() if line.startswith("| cache-hit | 2 |")]
+    assert len(hit_rows) == 1 and hit_rows[0].endswith("| 95% |"), hit_rows
     # Without --svg-dir the report keeps its text bar, so the default output does not change.
     assert BAR in text and "![" not in text, text
     # One SVG per workspace, setting and cold scenario with shares; noop has shares but no chart.
