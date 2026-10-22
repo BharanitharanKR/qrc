@@ -49,8 +49,8 @@ WORKFLOWS_DIR = ".github/workflows"
 Reader = Callable[[str], Optional[str]]
 
 _ON_KEY = re.compile(r"""^(?:on|"on"|'on')\s*:(.*)$""")
-_TRIGGER_LINE = re.compile(r"^(\s+)(?:-\s*)?([A-Za-z_][A-Za-z0-9_-]*)\s*(?::|$)")
-_WORD = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
+_SEQ_ITEM = re.compile(r"^\s*-\s*(.*)$")
 _LOCAL_USES = re.compile(r"""^\s*(?:-\s*)?uses\s*:\s*['"]?(\./[^'"\s#]*)""", re.MULTILINE)
 
 
@@ -72,34 +72,215 @@ def first_marker(text: str) -> Optional[str]:
     return None
 
 
+def _strip_trailing_comment(line: str) -> str:
+    """Drop ` # ...` outside quotes; YAML starts a comment only at whitespace."""
+    quote: Optional[str] = None
+    for i, ch in enumerate(line):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch == "#" and (i == 0 or line[i - 1].isspace()):
+            return line[:i]
+    return line
+
+
+def _balanced(text: str) -> bool:
+    """Whether every [] and {} in `text` is closed outside quotes and comments."""
+    depth = 0
+    quote: Optional[str] = None
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                if quote == "'" and i + 1 < len(text) and text[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+            if depth < 0:
+                return False
+        elif ch == "#" and (i == 0 or text[i - 1].isspace()):
+            newline = text.find("\n", i)
+            if newline == -1:
+                break
+            i = newline
+        i += 1
+    return depth == 0 and quote is None
+
+
+def _split_key(part: str) -> Optional[tuple[str, str]]:
+    """An event name and the text after its `:` from one flow item or block entry."""
+    part = part.strip()
+    if not part:
+        return None
+    if part[0] in "\"'":
+        quote = part[0]
+        i = 1
+        while i < len(part):
+            if part[i] == quote:
+                if quote == "'" and i + 1 < len(part) and part[i + 1] == "'":
+                    i += 2
+                    continue
+                break
+            i += 1
+        else:
+            return None
+        name = part[1:i]
+        rest = part[i + 1:].strip()
+        if rest.startswith(":"):
+            return name, rest[1:].strip()
+        return (name, "") if not rest else None
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*(?::(.*))?$", part, re.S)
+    if not match:
+        return None
+    return match.group(1), (match.group(2) or "").strip()
+
+
+def _event(part: str) -> Optional[str]:
+    key = _split_key(part)
+    if key is None:
+        return None
+    return key[0] if _IDENT.match(key[0]) else None
+
+
+def _split_flow(text: str) -> Optional[list[str]]:
+    """The top-level comma-separated items of a flow sequence or mapping."""
+    text = text.strip()
+    if len(text) < 2 or text[0] not in "[{" or text[-1] != ("]" if text[0] == "[" else "}"):
+        return None
+    items: list[str] = []
+    start = 1
+    depth = 0
+    quote: Optional[str] = None
+    i = 1
+    while i < len(text) - 1:
+        ch = text[i]
+        if quote:
+            if ch == quote:
+                if quote == "'" and i + 1 < len(text) - 1 and text[i + 1] == "'":
+                    i += 2
+                    continue
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            items.append(text[start:i])
+            start = i + 1
+        i += 1
+    items.append(text[start:-1])
+    return items
+
+
+def _flow_events(text: str) -> Optional[set[str]]:
+    items = _split_flow(text)
+    if items is None:
+        return None
+    found: set[str] = set()
+    for item in items:
+        if not item.strip():
+            continue
+        name = _event(item)
+        if name is None:
+            return None
+        found.add(name)
+    return found
+
+
 def triggers(text: str) -> Optional[set[str]]:
-    """The event names under the top-level `on:` key, or None if there is no such key."""
+    """The event names under the top-level `on:` key, or None when the key is absent or its
+    value cannot be read safely. Both block and flow YAML are read, including keys in quotes
+    and flow lists that span lines; anything else returns None, which `check` treats as
+    unreadable rather than as an empty event set."""
     lines = strip_comment_lines(text).splitlines()
     for i, line in enumerate(lines):
         match = _ON_KEY.match(line)
         if not match:
             continue
-        inline = re.split(r"\s#", match.group(1), maxsplit=1)[0].strip()
+        inline = _strip_trailing_comment(match.group(1)).strip()
         if inline:
-            # `on: push` or `on: [push, pull_request]` or a flow mapping. Every word counts,
-            # which can only over-report.
-            return set(_WORD.findall(inline))
+            if inline[0] in "[{":
+                block = inline
+                j = i + 1
+                while not _balanced(block):
+                    if j >= len(lines):
+                        return None
+                    nxt = _strip_trailing_comment(lines[j]).strip()
+                    if nxt and not lines[j][0].isspace():
+                        return None
+                    block += "\n" + nxt
+                    j += 1
+                return _flow_events(block)
+            name = _event(inline)
+            return {name} if name is not None else None
         found: set[str] = set()
         indent: Optional[int] = None
-        for body in lines[i + 1:]:
-            if not body.strip():
+        style: Optional[str] = None
+        j = i + 1
+        while j < len(lines):
+            raw = lines[j]
+            if not raw.strip():
+                j += 1
                 continue
-            if not body[0].isspace():
+            if not raw[0].isspace():
                 break  # the next top-level key
-            entry = _TRIGGER_LINE.match(body)
-            if not entry:
-                continue
-            depth = len(entry.group(1))
+            depth = len(raw) - len(raw.lstrip())
             if indent is None:
                 indent = depth
-            if depth == indent:
-                found.add(entry.group(2))
-        return found
+            if depth < indent:
+                return None
+            stripped = _strip_trailing_comment(raw).rstrip()
+            if depth > indent:
+                j += 1
+                continue
+            entry = stripped.strip()
+            if style is None:
+                if entry.startswith("-"):
+                    style = "seq"
+                elif entry[:1] in ("[", "{"):
+                    style = "flow"
+                else:
+                    style = "map"
+            if style == "flow":
+                block = entry
+                k = j + 1
+                while not _balanced(block):
+                    if k >= len(lines):
+                        return None
+                    nxt = _strip_trailing_comment(lines[k]).strip()
+                    if nxt and not lines[k][0].isspace():
+                        return None
+                    block += "\n" + nxt
+                    k += 1
+                events = _flow_events(block)
+                if events is None:
+                    return None
+                found |= events
+                j = k
+                continue
+            if style == "seq":
+                item = _SEQ_ITEM.match(stripped)
+                if not item:
+                    return None
+                name = _event(item.group(1))
+            else:
+                name = _event(entry)
+            if name is None:
+                return None
+            found.add(name)
+            j += 1
+        return found or None
     return None
 
 
@@ -179,8 +360,8 @@ def check(workflow_paths: Iterable[str], read: Reader, release_globs: Iterable[s
                                    "workflow that can run fork code with secrets must not "
                                    "use the shared cache (plan section 3.4)."))
         if reason and on is None and not release:
-            problems.append((path, f"{reason}, but its triggers cannot be read (no top-level "
-                                   "'on:' key), so the check cannot clear it."))
+            problems.append((path, f"{reason}, but its triggers cannot be read safely (no "
+                                   "readable top-level 'on:' block), so the check cannot clear it."))
         if (release or risky) and unreadable:
             for ref in unreadable:
                 problems.append((path, f"uses {ref}, which cannot be read, so the check "
@@ -292,6 +473,12 @@ def self_test() -> int:
         ("workflow_run in a flow list",
          {f"{wf}/ci.yml": _workflow("on: [push, workflow_run]", "run: sccache --show-stats")},
          (), {f"{wf}/ci.yml"}),
+        ("workflow_run in a flow list split across lines",
+         {f"{wf}/ci.yml": _workflow("on: [push,\n  workflow_run]", "run: sccache --show-stats")},
+         (), {f"{wf}/ci.yml"}),
+        ("pull_request_target with a quoted key and an empty mapping",
+         {f"{wf}/ci.yml": _workflow('on:\n  "pull_request_target": {}', "run: sccache --show-stats")},
+         (), {f"{wf}/ci.yml"}),
         ("pull_request_target in a block, quoted on key",
          {f"{wf}/ci.yml": _workflow('"on":\n  pull_request_target:\n    types: [opened]', "run: sccache -s")},
          (), {f"{wf}/ci.yml"}),
@@ -329,6 +516,9 @@ def self_test() -> int:
         (triggers("on:\n  push:\n    branches: [dev]\n  workflow_dispatch:\njobs: {}\n"),
          {"push", "workflow_dispatch"}),
         (triggers("on: push # pull_request_target is not used\n"), {"push"}),
+        (triggers('on:\n  "pull_request_target": {}\n'), {"pull_request_target"}),
+        (triggers("on: [push,\n  workflow_run]\n"), {"push", "workflow_run"}),
+        (triggers("on: [push,\n  workflow_run\n"), None),
         (triggers("name: no triggers\n"), None),
         (local_uses("      - uses: ./.github/actions/x\n    uses: './.github/workflows/y.yml'\n"),
          [".github/actions/x", ".github/workflows/y.yml"]),

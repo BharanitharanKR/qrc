@@ -147,9 +147,11 @@ stat_value() { # label, stat name: a number from the saved stats, or empty
 object_count() { # objects in the bucket, through the admin alias; empty if rc fails
   # The summary's field name is not part of rc's documented interface, so accept the
   # spellings a JSON encoder is likely to produce and take the last match.
-  { rc ls --recursive --summarize --json "e2eadmin/$bucket" 2> /dev/null || true; } |
+  # An unavailable count is empty, not fatal: with `pipefail`, a failed `rc`, `grep` or `sed`
+  # would otherwise fail this assignment under `set -e` and stop the test before it reports.
+  { { rc ls --recursive --summarize --json "e2eadmin/$bucket" 2> /dev/null || true; } |
     grep -o -E '"(total_objects|totalObjects)"[[:space:]]*:[[:space:]]*[0-9]+' |
-    sed -E 's/^[^:]*:[[:space:]]*//' | tail -n 1
+    sed -E 's/^[^:]*:[[:space:]]*//' | tail -n 1; } || true
 }
 
 use_key() { # key file from setup.sh: the S3 key the next sccache server uses
