@@ -42,7 +42,7 @@ the median and the spread.
 | `noop` | second `cargo build` with no changes | Fixed overhead (fingerprinting, scheduling) |
 | `touch-leaf` | edit a leaf crate (a binary's `main.rs`), rebuild | Typical local edit loop |
 | `touch-core` | edit a widely depended-on workspace crate, rebuild | Worst-case local edit |
-| `deps-only` | build dependencies only (for example via `cargo chef cook` or a dependency-only manifest) | The share that a dependency cache layer could remove |
+| `deps-only` | build dependencies only: the harness reads it off the cold build's timings as the moment the last dependency unit finished (no separate build; `cargo chef cook` would measure the same thing with a second toolchain) | The share that a dependency cache layer could remove |
 
 ## 3. Configurations
 
@@ -58,11 +58,11 @@ The harness should still accept a named configuration so the Phase 1 runs are a 
 ## 4. Profiling harness
 
 All tools below are standard; nothing new is built in Phase 0 except a thin driver script in
-`bench/`.
+`bench/` ([`bench/run.py`](../bench/run.py), with [`bench/analyze.py`](../bench/analyze.py) for the §5 report).
 
 | Tool | What it gives | Notes |
 |---|---|---|
-| `cargo build --timings` | Per-unit start/end times, codegen vs. front-end split per crate, CPU concurrency over time | Writes an HTML report under `target/cargo-timings/`. On nightly, `-Zunstable-options --timings=json` also gives machine-readable output; prefer it for analysis |
+| `cargo build --timings` | Per-unit start/end times, codegen vs. front-end split per crate, CPU concurrency over time | Writes an HTML report under `target/cargo-timings/`. Current cargo (stable 1.99, the 2026-10 nightlies) takes `--timings` without a value and no longer accepts `--timings=json`; the report embeds the same data as JSON (`UNIT_DATA`, `CONCURRENCY_DATA`, `CPU_USAGE`), which the harness reads |
 | `RUSTFLAGS="-Zself-profile=<dir>"` (nightly) | Per-query time inside rustc: parse, expansion, resolution, typeck, borrowck, MIR, monomorphization, LLVM, linking | Summarize with `summarize` and `crox` from [measureme](https://github.com/rust-lang/measureme). Add `-Zself-profile-events=default,args` only for spot runs, it is heavy |
 | `cargo build --unit-graph -Zunstable-options` (nightly) | The unit graph: the critical path and the theoretical parallelism | Input for Layer 3 (`qrcd`) design |
 | `/usr/bin/time -v` (Linux) or `/usr/bin/time -l` (macOS) | Wall time, user + system CPU time, peak RSS | Wrap the whole cargo invocation |
@@ -85,7 +85,7 @@ Always (design §11): wall time, CPU time, peak RSS, and the per-phase breakdown
 
 ### Output format
 
-One JSON object per run, appended to `bench/results/<date>-<machine>.jsonl`. Raw traces
+One JSON object per run, appended to `bench/results/<date>-<machine>.jsonl` (`bench/run.py` writes it, with extra fields beside the ones below; [the bench README](../bench/README.md#fields-beyond-the-plans-schema) lists them). Raw traces
 (self-profile data, timings HTML) go to `bench/results/raw/`, which is git-ignored; only the
 JSONL and the summaries are committed.
 
@@ -118,8 +118,10 @@ JSONL and the summaries are committed.
 }
 ```
 
-The `share` fields are fractions of wall time and should sum to about 1.0; the analysis script
-reports how far off they are, since the attribution from `--timings` and `-Zself-profile` overlaps.
+The `share` fields are fractions of the build's slot capacity (wall time x `jobs`) and should sum to
+about 1.0 together with `idle`; `share_sum` records how far off they are, since the attribution from
+`--timings` and `-Zself-profile` overlaps. `link` and `debuginfo` are `null` on stable, where there is
+no self-profile.
 
 ## 5. Deliverable
 

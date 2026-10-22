@@ -2,8 +2,9 @@
 #
 # Every workspace is pinned to an exact commit and toolchain so that a run on
 # another machine measures the same inputs. The size facts were read from each
-# repository's tree at the pinned commit on the `checked` date; the harness
-# re-measures them at run time and reports both. `scripts/check-corpus.py`
+# repository's tree at the pinned commit on the `checked` date, with the
+# definitions below; the harness (bench/run.py, size_facts) measures them again
+# from the checkout, records them in every result and warns on a difference. `scripts/check-corpus.py`
 # checks this file's shape and, with --verify-pins, that each `ref` still
 # points at its `commit`.
 #
@@ -15,9 +16,11 @@
 #   manifests                       Cargo.toml files in the tree
 #   lock_packages                   [[package]] entries in Cargo.lock
 #   rs_files, rs_lines              .rs files and their line count (wc -l), target/ excluded
-#   integration_tests               <crate>/tests/*.rs files: an upper bound on test binaries
-#                                   from integration tests, on top of one per lib and bin
-#   build_scripts                   build.rs files
+#   integration_tests               .rs files directly in a crate's tests/ directory (the one
+#                                   beside a Cargo.toml): cargo's default integration-test
+#                                   targets, before autotests and [[test]] entries; the harness
+#                                   records the test binaries actually built
+#   build_scripts                   files named build.rs
 #   touch_leaf, touch_core          the files the touch-leaf and touch-core scenarios edit (§2)
 #   system_libs                     the base list of packages a fresh Debian/Ubuntu machine needs
 #                                   before cargo can build the workspace (Linux); release-specific
@@ -44,8 +47,8 @@ manifests = 101
 lock_packages = 1410
 rs_files = 2251
 rs_lines = 968003
-integration_tests = 281
-build_scripts = 28
+integration_tests = 405
+build_scripts = 23
 touch_leaf = "crates/loams/src/main.rs"
 touch_core = "crates/loams-meta/src/lib.rs"
 system_libs = ["protobuf-compiler", "build-essential"]
@@ -64,7 +67,7 @@ manifests = 11
 lock_packages = 59
 rs_files = 100
 rs_lines = 53025
-integration_tests = 5
+integration_tests = 15
 build_scripts = 1
 touch_leaf = "crates/core/main.rs"
 touch_core = "crates/matcher/src/lib.rs"
@@ -84,7 +87,7 @@ manifests = 48
 lock_packages = 1030
 rs_files = 1944
 rs_lines = 455210
-integration_tests = 30
+integration_tests = 31
 build_scripts = 4
 touch_leaf = "src/main.rs"
 touch_core = "crates/nu-protocol/src/lib.rs"
@@ -104,8 +107,8 @@ manifests = 266
 lock_packages = 1791
 rs_files = 2007
 rs_lines = 1761136
-integration_tests = 22
-build_scripts = 18
+integration_tests = 9
+build_scripts = 17
 touch_leaf = "crates/zed/src/main.rs"
 touch_core = "crates/gpui/src/gpui.rs"
 system_libs = [

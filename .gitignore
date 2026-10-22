@@ -14,3 +14,5 @@ bench/results/raw/
 .vscode/
 *.swp
 .DS_Store
+# Python bytecode from the bench and check scripts
+__pycache__/
