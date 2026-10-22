@@ -1,0 +1,57 @@
+{
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "autoReview": ["open"],
+  "triggerOnDrafts": false,
+  "includeBranches": ["main"],
+  "excludeAuthors": ["dependabot[bot]", "nx-cloud[bot]", "github-actions[bot]", "release-please[bot]", "renovate[bot]"],
+  "disabledLabels": ["skip-greptile"],
+  "ignorePatterns": "Cargo.lock\n**/*.snap\n**/__snapshots__/**\n**/snapshots/**\n**/fixtures/**\n**/testdata/**\n**/dist/**\n**/target/**\n**/node_modules/**",
+  "instructions": "qrc is a small research project (MIT OR Apache-2.0) to make Rust debug builds as fast as possible while release builds keep stock rustc and LLVM. It is at the design and benchmarking stage. Review for correctness of claims and code first: every number is either cited or marked as a target, and benchmark methods are reproducible. Skip formatting and naming nits. Comment only when you can name the concrete problem.",
+  "rules": [
+    {
+      "id": "cited-numbers",
+      "severity": "medium",
+      "scope": ["**/*.md"],
+      "rule": "Every performance number is quoted from a cited source or labelled as a target to validate; flag unsupported speedup claims and benchmarks without the machine, toolchain and command used."
+    },
+    {
+      "id": "no-unwrap",
+      "severity": "medium",
+      "scope": ["**/*.rs"],
+      "rule": "Non-test Rust code must not call unwrap() or expect() unless a comment says why it cannot fail; errors carry context."
+    },
+    {
+      "id": "verify-lane",
+      "severity": "high",
+      "rule": "The fast lane must never change what the verify lane (stock cargo check, stock rustc + LLVM release builds) produces or accepts; flag changes that could let a fast-lane result replace a verify-lane check."
+    },
+    {
+      "id": "no-secrets",
+      "severity": "high",
+      "rule": "Never print, log, commit or echo secrets: tokens, passwords, keys, connection strings with credentials or Authorization headers, including in error messages, debug output, tests and CI logs. Flag any secret in the diff."
+    },
+    {
+      "id": "licence",
+      "severity": "high",
+      "rule": "No code copied from AGPL, GPL, LGPL, BSL (Business Source), FSL, SSPL or ELv2 projects, and no such dependency (Loams D11, D1574). Copied permissive code keeps its notice. Never suggest code taken from such projects. Contributions are dual-licensed MIT OR Apache-2.0, so copied code must allow both."
+    },
+    {
+      "id": "ci-workflows",
+      "severity": "medium",
+      "scope": [".github/**"],
+      "rule": "Workflows keep least-privilege permissions, pin third-party actions to a full commit SHA, and never expose secrets to pull_request_target code from forks."
+    },
+    {
+      "id": "plain-docs",
+      "severity": "low",
+      "scope": ["**/*.md", "**/*.mdx"],
+      "rule": "Docs are plain English: short sentences, no marketing language, statuses not overstated. Commands, flags, paths and links must be correct. Flag only real errors, not wording preferences."
+    },
+    {
+      "id": "dco",
+      "severity": "low",
+      "rule": "Every commit needs a DCO Signed-off-by trailer (git commit -s); the DCO check enforces it, so mention it only if the PR asks contributors to skip it."
+    }
+  ]
+}
